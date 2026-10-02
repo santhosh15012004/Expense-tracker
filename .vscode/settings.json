@@ -1,0 +1,12 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python.defaultInterpreterPath": "C:\\Users\\SPLPT\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/backend",
+        "C:\\Users\\SPLPT\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages"
+    ],
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}/backend",
+        "C:\\Users\\SPLPT\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages"
+    ]
+}
