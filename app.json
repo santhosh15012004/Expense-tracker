@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "Santa Expense Tracker",
-    "slug": "santa-expense-tracker",
+    "name": "Expense Tracker",
+    "slug": "expense-tracker",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -24,6 +24,11 @@
       "expo-sqlite",
       "expo-sharing",
       "expo-font"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "4231c9a0-2d3c-44d7-9fba-3301f91a747f"
+      }
+    }
   }
 }
