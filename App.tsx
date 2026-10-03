@@ -14,6 +14,7 @@ import {
   Image,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import Svg, { G, Path, Circle, Rect, Text as SvgText } from 'react-native-svg';
 import {
   initDatabase,
   getTransactions,
@@ -24,6 +25,8 @@ import {
   deleteTransaction,
   getCategoryBreakdown,
   getMonthlyTrends,
+  getDailySpendForMonth,
+  addCustomCategory,
   getAppSettings,
   saveAppSetting,
   resetAllData,
@@ -34,6 +37,7 @@ import {
   WalletSummary,
   CategorySpend,
   MonthlySpend,
+  DailySpend,
   AppSettings,
   TransactionType,
   PaymentMethod,
@@ -41,6 +45,7 @@ import {
 import { exportBackupToFile, exportToSpreadsheetCSV, restoreBackup } from './src/utils/backup';
 
 type TabType = 'home' | 'analytics' | 'history' | 'settings';
+type ChartMode = 'pie' | 'categoryBars' | 'dailyHistogram';
 
 // Indian currency number formatter
 function formatINR(val: number): string {
@@ -50,6 +55,350 @@ function formatINR(val: number): string {
     maximumFractionDigits: 2,
   });
   return (val < 0 ? '-' : '') + '₹' + formatted;
+}
+
+// Donut Pie SVG helper functions
+function getCoordinatesForPercent(percent: number, radius: number, cx: number, cy: number) {
+  const angle = 2 * Math.PI * percent - Math.PI / 2;
+  const x = cx + radius * Math.cos(angle);
+  const y = cy + radius * Math.sin(angle);
+  return [x, y];
+}
+
+function createDonutPath(
+  startPercent: number,
+  endPercent: number,
+  innerR: number,
+  outerR: number,
+  cx: number,
+  cy: number
+) {
+  const [startX, startY] = getCoordinatesForPercent(startPercent, outerR, cx, cy);
+  const [endX, endY] = getCoordinatesForPercent(endPercent, outerR, cx, cy);
+  const [innerStartX, innerStartY] = getCoordinatesForPercent(endPercent, innerR, cx, cy);
+  const [innerEndX, innerEndY] = getCoordinatesForPercent(startPercent, innerR, cx, cy);
+
+  const isLargeArc = endPercent - startPercent > 0.5 ? 1 : 0;
+
+  return `M ${startX.toFixed(2)} ${startY.toFixed(2)} A ${outerR} ${outerR} 0 ${isLargeArc} 1 ${endX.toFixed(2)} ${endY.toFixed(2)} L ${innerStartX.toFixed(2)} ${innerStartY.toFixed(2)} A ${innerR} ${innerR} 0 ${isLargeArc} 0 ${innerEndX.toFixed(2)} ${innerEndY.toFixed(2)} Z`;
+}
+
+// ==================== 1. PIE / DONUT CHART COMPONENT ====================
+function PieChartComponent({
+  data,
+  totalAmount,
+  selectedIndex,
+  onSelectIndex,
+}: {
+  data: CategorySpend[];
+  totalAmount: number;
+  selectedIndex: number | null;
+  onSelectIndex: (idx: number | null) => void;
+}) {
+  const size = 220;
+  const cx = size / 2;
+  const cy = size / 2;
+  const outerR = 92;
+  const innerR = 54;
+
+  if (data.length === 0 || totalAmount <= 0) {
+    return (
+      <View style={styles.chartEmptyCard}>
+        <Ionicons name="pie-chart-outline" size={44} color="#94A3B8" />
+        <Text style={styles.chartEmptyTitle}>No expenses recorded for this month</Text>
+        <Text style={styles.chartEmptySub}>Tap "+ Add UPI" or "+ Add Cash" to log expenses.</Text>
+      </View>
+    );
+  }
+
+  let cumulative = 0;
+  const slices = data.map((item, index) => {
+    const fraction = item.total / totalAmount;
+    const startPercent = cumulative;
+    cumulative += fraction;
+    const endPercent = cumulative;
+    return {
+      item,
+      index,
+      startPercent,
+      endPercent,
+      fraction,
+    };
+  });
+
+  const selectedItem = selectedIndex !== null ? data[selectedIndex] : null;
+
+  return (
+    <View style={styles.pieContainer}>
+      <View style={styles.svgRelativeWrap}>
+        <Svg width={size} height={size}>
+          <G>
+            {slices.map((slice) => {
+              const isSelected = selectedIndex === slice.index;
+              const isSingle = slice.fraction >= 0.999;
+              const sliceR = isSelected ? outerR + 5 : outerR;
+
+              if (isSingle) {
+                return (
+                  <Circle
+                    key={slice.index}
+                    cx={cx}
+                    cy={cy}
+                    r={(outerR + innerR) / 2}
+                    stroke={slice.item.color}
+                    strokeWidth={outerR - innerR + (isSelected ? 6 : 0)}
+                    fill="none"
+                    onPress={() => onSelectIndex(isSelected ? null : slice.index)}
+                  />
+                );
+              }
+
+              const pathData = createDonutPath(
+                slice.startPercent,
+                slice.endPercent,
+                innerR,
+                sliceR,
+                cx,
+                cy
+              );
+
+              return (
+                <Path
+                  key={slice.index}
+                  d={pathData}
+                  fill={slice.item.color}
+                  stroke="#FFFFFF"
+                  strokeWidth={2}
+                  onPress={() => onSelectIndex(isSelected ? null : slice.index)}
+                />
+              );
+            })}
+          </G>
+        </Svg>
+
+        {/* Center Donut Hole info */}
+        <View style={styles.donutCenterHole} pointerEvents="none">
+          <Text style={styles.donutCenterCategory} numberOfLines={1}>
+            {selectedItem ? selectedItem.category : 'Total Spent'}
+          </Text>
+          <Text style={styles.donutCenterAmount} numberOfLines={1}>
+            {formatINR(selectedItem ? selectedItem.total : totalAmount)}
+          </Text>
+          {selectedItem ? (
+            <Text style={styles.donutCenterPercent}>{selectedItem.percentage}%</Text>
+          ) : (
+            <Text style={styles.donutCenterSub}>{data.length} categories</Text>
+          )}
+        </View>
+      </View>
+
+      {/* Selected Item Spotlight Card */}
+      {selectedItem && (
+        <View style={[styles.spotlightCard, { borderColor: selectedItem.color }]}>
+          <View style={styles.spotlightHeader}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <View style={[styles.spotlightDot, { backgroundColor: selectedItem.color }]} />
+              <Text style={styles.spotlightCategoryName}>{selectedItem.category}</Text>
+            </View>
+            <TouchableOpacity onPress={() => onSelectIndex(null)}>
+              <Ionicons name="close-circle" size={18} color="#64748B" />
+            </TouchableOpacity>
+          </View>
+          <View style={styles.spotlightDetailsRow}>
+            <Text style={styles.spotlightTotal}>
+              {formatINR(selectedItem.total)} ({selectedItem.percentage}%)
+            </Text>
+            <View style={styles.spotlightWallets}>
+              <Text style={styles.spotlightWalletText}>
+                📱 UPI: {formatINR(selectedItem.upiTotal)}
+              </Text>
+              <Text style={styles.spotlightWalletText}>
+                💵 Cash: {formatINR(selectedItem.cashTotal)}
+              </Text>
+            </View>
+          </View>
+        </View>
+      )}
+
+      {/* Legend Chips Grid */}
+      <View style={styles.pieLegendRow}>
+        {data.map((cat, idx) => {
+          const isSelected = selectedIndex === idx;
+          return (
+            <TouchableOpacity
+              key={idx}
+              style={[
+                styles.pieLegendChip,
+                isSelected && { backgroundColor: cat.color + '22', borderColor: cat.color },
+              ]}
+              onPress={() => onSelectIndex(isSelected ? null : idx)}
+            >
+              <View style={[styles.pieLegendDot, { backgroundColor: cat.color }]} />
+              <Text style={styles.pieLegendLabel} numberOfLines={1}>
+                {cat.category}
+              </Text>
+              <Text style={styles.pieLegendPercent}>{cat.percentage}%</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+// ==================== 2. CATEGORY HISTOGRAM COMPONENT ====================
+function CategoryHistogramComponent({
+  data,
+  totalAmount,
+}: {
+  data: CategorySpend[];
+  totalAmount: number;
+}) {
+  if (data.length === 0 || totalAmount <= 0) {
+    return (
+      <View style={styles.chartEmptyCard}>
+        <Ionicons name="bar-chart-outline" size={44} color="#94A3B8" />
+        <Text style={styles.chartEmptyTitle}>No expenses recorded for this month</Text>
+        <Text style={styles.chartEmptySub}>Tap "+ Add UPI" or "+ Add Cash" to log expenses.</Text>
+      </View>
+    );
+  }
+
+  const maxVal = Math.max(...data.map((d) => d.total), 1);
+
+  return (
+    <View style={styles.histogramCardContainer}>
+      <Text style={styles.histogramSubHeader}>Category Spend Comparison (UPI vs Cash)</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginVertical: 12 }}>
+        <View style={styles.catHistogramRow}>
+          {data.map((cat, idx) => {
+            const barH = Math.max(16, Math.round((cat.total / maxVal) * 130));
+            const upiH = cat.total > 0 ? (cat.upiTotal / cat.total) * barH : 0;
+            const cashH = barH - upiH;
+
+            return (
+              <View key={idx} style={styles.catHistCol}>
+                <Text style={styles.catHistValText}>{formatINR(cat.total)}</Text>
+                <View style={[styles.catHistBarWrapper, { height: barH }]}>
+                  {upiH > 0 && (
+                    <View style={{ height: upiH, backgroundColor: '#4F46E5', width: '100%' }} />
+                  )}
+                  {cashH > 0 && (
+                    <View style={{ height: cashH, backgroundColor: '#059669', width: '100%' }} />
+                  )}
+                </View>
+
+                <View style={[styles.catHistIconBadge, { backgroundColor: cat.color + '22' }]}>
+                  <Ionicons name={(cat.icon as any) || 'pricetag'} size={14} color={cat.color} />
+                </View>
+                <Text style={styles.catHistNameText} numberOfLines={1}>
+                  {cat.category}
+                </Text>
+                <Text style={styles.catHistPercentText}>{cat.percentage}%</Text>
+              </View>
+            );
+          })}
+        </View>
+      </ScrollView>
+
+      <View style={styles.chartLegendFoot}>
+        <View style={styles.legendItem}>
+          <View style={[styles.legendBox, { backgroundColor: '#4F46E5' }]} />
+          <Text style={styles.legendText}>UPI Spent</Text>
+        </View>
+        <View style={styles.legendItem}>
+          <View style={[styles.legendBox, { backgroundColor: '#059669' }]} />
+          <Text style={styles.legendText}>Cash Spent</Text>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+// ==================== 3. DAILY HISTOGRAM COMPONENT (1st to 31st) ====================
+function DailyHistogramComponent({ data }: { data: DailySpend[] }) {
+  const maxDayVal = Math.max(...data.map((d) => d.total), 1);
+  const activeDays = data.filter((d) => d.total > 0);
+  const totalMonthSpent = data.reduce((acc, d) => acc + d.total, 0);
+
+  if (activeDays.length === 0 || totalMonthSpent <= 0) {
+    return (
+      <View style={styles.chartEmptyCard}>
+        <Ionicons name="calendar-outline" size={44} color="#94A3B8" />
+        <Text style={styles.chartEmptyTitle}>No daily expenses recorded for this month</Text>
+        <Text style={styles.chartEmptySub}>Expenses you log will show on their day of the month.</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.histogramCardContainer}>
+      <View style={styles.dailyHeaderMeta}>
+        <Text style={styles.histogramSubHeader}>Day-by-Day Spend Pattern (1st - 31st)</Text>
+        <Text style={styles.dailyActiveCount}>{activeDays.length} spending days</Text>
+      </View>
+
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginVertical: 10 }}>
+        <View style={styles.dailyHistBarsRow}>
+          {data.map((item) => {
+            const hasSpent = item.total > 0;
+            const barH = hasSpent ? Math.max(10, Math.round((item.total / maxDayVal) * 120)) : 4;
+            const upiH = hasSpent && item.total > 0 ? (item.upi / item.total) * barH : 0;
+            const cashH = barH - upiH;
+
+            return (
+              <View key={item.day} style={styles.dailyHistCol}>
+                {hasSpent ? (
+                  <Text style={styles.dailyHistVal}>₹{Math.round(item.total)}</Text>
+                ) : (
+                  <View style={{ height: 11 }} />
+                )}
+                <View
+                  style={[
+                    styles.dailyHistBarTrack,
+                    {
+                      height: barH,
+                      backgroundColor: hasSpent ? 'transparent' : '#E2E8F0',
+                    },
+                  ]}
+                >
+                  {hasSpent && (
+                    <>
+                      {upiH > 0 && (
+                        <View style={{ height: upiH, backgroundColor: '#4F46E5', width: '100%' }} />
+                      )}
+                      {cashH > 0 && (
+                        <View style={{ height: cashH, backgroundColor: '#059669', width: '100%' }} />
+                      )}
+                    </>
+                  )}
+                </View>
+                <Text
+                  style={[
+                    styles.dailyHistDayLabel,
+                    hasSpent && { color: '#0F172A', fontWeight: '800' },
+                  ]}
+                >
+                  {item.day}
+                </Text>
+              </View>
+            );
+          })}
+        </View>
+      </ScrollView>
+
+      <View style={styles.chartLegendFoot}>
+        <View style={styles.legendItem}>
+          <View style={[styles.legendBox, { backgroundColor: '#4F46E5' }]} />
+          <Text style={styles.legendText}>UPI</Text>
+        </View>
+        <View style={styles.legendItem}>
+          <View style={[styles.legendBox, { backgroundColor: '#059669' }]} />
+          <Text style={styles.legendText}>Cash</Text>
+        </View>
+      </View>
+    </View>
+  );
 }
 
 export default function App() {
@@ -89,13 +438,49 @@ export default function App() {
   const [title, setTitle] = useState('');
   const [amount, setAmount] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<Category | null>(null);
+  const [customCategoryInput, setCustomCategoryInput] = useState('');
   const [txDate, setTxDate] = useState(new Date().toISOString().split('T')[0]);
   const [notes, setNotes] = useState('');
+
+  // Monthly Analytics Chart State
+  const [dailySpends, setDailySpends] = useState<DailySpend[]>([]);
+  const [chartMode, setChartMode] = useState<ChartMode>('pie');
+  const [selectedSliceIndex, setSelectedSliceIndex] = useState<number | null>(null);
 
   // Settings State
   const [budgetInput, setBudgetInput] = useState('');
   const [restoreModalVisible, setRestoreModalVisible] = useState(false);
   const [restoreJsonInput, setRestoreJsonInput] = useState('');
+
+  // Month Navigation
+  const formatMonthDisplay = (monthStr: string) => {
+    const parts = monthStr.split('-');
+    const date = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, 1);
+    return date.toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+  };
+
+  const handlePrevMonth = () => {
+    const parts = selectedMonth.split('-');
+    const y = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    const d = new Date(y, m - 2, 1);
+    setSelectedMonth(d.toISOString().slice(0, 7));
+    setSelectedSliceIndex(null);
+  };
+
+  const handleNextMonth = () => {
+    const parts = selectedMonth.split('-');
+    const y = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    const d = new Date(y, m, 1);
+    setSelectedMonth(d.toISOString().slice(0, 7));
+    setSelectedSliceIndex(null);
+  };
+
+  const handleCurrentMonth = () => {
+    setSelectedMonth(currentMonthStr);
+    setSelectedSliceIndex(null);
+  };
 
   // Load all SQLite/local data
   const loadAllData = useCallback(() => {
@@ -112,6 +497,9 @@ export default function App() {
 
       const breakdown = getCategoryBreakdown(selectedMonth);
       setCategoryBreakdown(breakdown);
+
+      const daily = getDailySpendForMonth(selectedMonth);
+      setDailySpends(daily);
 
       const trends = getMonthlyTrends(6);
       setMonthlyTrends(trends);
@@ -141,6 +529,7 @@ export default function App() {
     setTitle('');
     setAmount('');
     setNotes('');
+    setCustomCategoryInput('');
     setTxDate(new Date().toISOString().split('T')[0]);
 
     const matchingCat = categories.find((c) => c.type === type) || categories[0] || null;
@@ -158,21 +547,30 @@ export default function App() {
     setNotes(tx.notes || '');
     setTxDate(tx.date);
 
-    const match = categories.find((c) => c.name === tx.category) || null;
-    setSelectedCategory(
-      match || {
-        id: 'temp',
-        name: tx.category,
-        icon: tx.categoryIcon || 'pricetag',
-        color: tx.categoryColor || '#3B82F6',
-        type: tx.type,
-      }
+    const match = categories.find((c) => c.name.toLowerCase() === tx.category.toLowerCase()) || null;
+    const isOtherCat = tx.category.toLowerCase().includes('other');
+    const isStandard = categories.some(
+      (c) => c.name.toLowerCase() === tx.category.toLowerCase() && !c.name.toLowerCase().includes('other')
     );
+
+    if (!isStandard) {
+      // It's a custom category or 'other'
+      setCustomCategoryInput(isOtherCat ? '' : tx.category);
+      const otherCat = categories.find(
+        (c) => c.type === tx.type && c.name.toLowerCase().includes('other')
+      );
+      setSelectedCategory(otherCat || match);
+    } else {
+      setCustomCategoryInput('');
+      setSelectedCategory(match);
+    }
+
     setModalVisible(true);
   };
 
   const handleTypeChange = (newType: TransactionType) => {
     setTxType(newType);
+    setCustomCategoryInput('');
     const firstMatchingCat = categories.find((c) => c.type === newType);
     if (firstMatchingCat) {
       setSelectedCategory(firstMatchingCat);
@@ -196,14 +594,24 @@ export default function App() {
     }
 
     try {
+      const isOther =
+        selectedCategory.name.toLowerCase().includes('other') ||
+        selectedCategory.id.includes('other');
+      let finalCategory = selectedCategory;
+
+      if (isOther && customCategoryInput.trim()) {
+        const customCat = addCustomCategory(customCategoryInput.trim(), txType);
+        finalCategory = customCat;
+      }
+
       if (editingTransaction) {
         updateTransaction(editingTransaction.id, {
           title: title.trim(),
           amount: parsedAmount,
           type: txType,
-          category: selectedCategory.name,
-          categoryIcon: selectedCategory.icon,
-          categoryColor: selectedCategory.color,
+          category: finalCategory.name,
+          categoryIcon: finalCategory.icon,
+          categoryColor: finalCategory.color,
           paymentMethod,
           date: txDate,
           notes: notes.trim(),
@@ -213,9 +621,9 @@ export default function App() {
           title: title.trim(),
           amount: parsedAmount,
           type: txType,
-          category: selectedCategory.name,
-          categoryIcon: selectedCategory.icon,
-          categoryColor: selectedCategory.color,
+          category: finalCategory.name,
+          categoryIcon: finalCategory.icon,
+          categoryColor: finalCategory.color,
           paymentMethod,
           date: txDate,
           notes: notes.trim(),
@@ -223,6 +631,7 @@ export default function App() {
       }
 
       setModalVisible(false);
+      setCustomCategoryInput('');
       loadAllData();
     } catch (e: any) {
       Alert.alert('Error', e?.message || 'Failed to save transaction');
@@ -627,9 +1036,135 @@ export default function App() {
           {/* ==================== 2. ANALYTICS TAB ==================== */}
           {activeTab === 'analytics' && (
             <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-              <Text style={styles.sectionTitle}>Cash vs UPI Outflow</Text>
+              {/* Interactive Month Selector Bar */}
+              <View style={styles.monthSelectorBar}>
+                <TouchableOpacity style={styles.monthArrowBtn} onPress={handlePrevMonth}>
+                  <Ionicons name="chevron-back" size={18} color="#0F172A" />
+                </TouchableOpacity>
+
+                <View style={styles.monthCenterInfo}>
+                  <Ionicons name="calendar" size={15} color="#4F46E5" style={{ marginRight: 6 }} />
+                  <Text style={styles.monthCenterTitle}>{formatMonthDisplay(selectedMonth)}</Text>
+                  {selectedMonth !== currentMonthStr && (
+                    <TouchableOpacity style={styles.currentBadgeBtn} onPress={handleCurrentMonth}>
+                      <Text style={styles.currentBadgeText}>Current Month</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+
+                <TouchableOpacity style={styles.monthArrowBtn} onPress={handleNextMonth}>
+                  <Ionicons name="chevron-forward" size={18} color="#0F172A" />
+                </TouchableOpacity>
+              </View>
+
+              {/* Monthly Visual Charts Card */}
+              <View style={styles.chartsCard}>
+                <View style={styles.chartsCardTopRow}>
+                  <View>
+                    <Text style={styles.chartsCardTitle}>Monthly Spending Charts</Text>
+                    <Text style={styles.chartsCardSub}>
+                      {formatMonthDisplay(selectedMonth)} • {formatINR(wallet.totalExpense)} Spent
+                    </Text>
+                  </View>
+                </View>
+
+                {/* 3-Way Chart Switcher */}
+                <View style={styles.chartSwitcherRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.chartSwitchBtn,
+                      chartMode === 'pie' && styles.chartSwitchBtnActive,
+                    ]}
+                    onPress={() => setChartMode('pie')}
+                  >
+                    <Ionicons
+                      name="pie-chart"
+                      size={14}
+                      color={chartMode === 'pie' ? '#FFFFFF' : '#64748B'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.chartSwitchBtnText,
+                        chartMode === 'pie' && styles.chartSwitchBtnTextActive,
+                      ]}
+                    >
+                      Pie Chart
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.chartSwitchBtn,
+                      chartMode === 'categoryBars' && styles.chartSwitchBtnActive,
+                    ]}
+                    onPress={() => setChartMode('categoryBars')}
+                  >
+                    <Ionicons
+                      name="stats-chart"
+                      size={14}
+                      color={chartMode === 'categoryBars' ? '#FFFFFF' : '#64748B'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.chartSwitchBtnText,
+                        chartMode === 'categoryBars' && styles.chartSwitchBtnTextActive,
+                      ]}
+                    >
+                      Categories
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.chartSwitchBtn,
+                      chartMode === 'dailyHistogram' && styles.chartSwitchBtnActive,
+                    ]}
+                    onPress={() => setChartMode('dailyHistogram')}
+                  >
+                    <Ionicons
+                      name="bar-chart"
+                      size={14}
+                      color={chartMode === 'dailyHistogram' ? '#FFFFFF' : '#64748B'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.chartSwitchBtnText,
+                        chartMode === 'dailyHistogram' && styles.chartSwitchBtnTextActive,
+                      ]}
+                    >
+                      Daily Trend
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* Render Selected Visualizer */}
+                {chartMode === 'pie' && (
+                  <PieChartComponent
+                    data={categoryBreakdown}
+                    totalAmount={wallet.totalExpense}
+                    selectedIndex={selectedSliceIndex}
+                    onSelectIndex={setSelectedSliceIndex}
+                  />
+                )}
+
+                {chartMode === 'categoryBars' && (
+                  <CategoryHistogramComponent
+                    data={categoryBreakdown}
+                    totalAmount={wallet.totalExpense}
+                  />
+                )}
+
+                {chartMode === 'dailyHistogram' && (
+                  <DailyHistogramComponent data={dailySpends} />
+                )}
+              </View>
+
+              <Text style={[styles.sectionTitle, { marginTop: 20 }]}>Cash vs UPI Outflow</Text>
               <Text style={styles.sectionSubtitle}>
-                How you spent money in {selectedMonth}
+                How you spent money in {formatMonthDisplay(selectedMonth)}
               </Text>
 
               {/* Cash vs UPI Outflow Split Card */}
@@ -1281,6 +1816,29 @@ export default function App() {
                     );
                   })}
                 </ScrollView>
+
+                {/* 5.1 Custom Category Input (When 'Other' category is selected) */}
+                {selectedCategory &&
+                  (selectedCategory.name.toLowerCase().includes('other') ||
+                    selectedCategory.id.includes('other')) && (
+                    <View style={styles.customCatBox}>
+                      <View style={styles.customCatHeader}>
+                        <Ionicons name="sparkles" size={15} color="#4F46E5" />
+                        <Text style={styles.customCatTitle}>Specify Custom Category Name</Text>
+                      </View>
+                      <TextInput
+                        style={styles.customCatInput}
+                        placeholder="e.g. Gym, Books, Petrol, Maintenance, Pet Care..."
+                        placeholderTextColor="#94A3B8"
+                        value={customCategoryInput}
+                        onChangeText={setCustomCategoryInput}
+                        autoCapitalize="words"
+                      />
+                      <Text style={styles.customCatHint}>
+                        ⚡ This custom category will be tracked in your monthly pie chart & histogram!
+                      </Text>
+                    </View>
+                  )}
 
                 {/* 6. Date */}
                 <Text style={styles.inputLabel}>Date (YYYY-MM-DD)</Text>
@@ -2403,5 +2961,413 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '800',
+  },
+
+  // Custom Category Box in Modal
+  customCatBox: {
+    backgroundColor: '#EEF2FF',
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1.5,
+    borderColor: '#C7D2FE',
+    marginTop: 10,
+    marginBottom: 6,
+  },
+  customCatHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 6,
+  },
+  customCatTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#3730A3',
+  },
+  customCatInput: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#A5B4FC',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 14,
+    color: '#0F172A',
+    fontWeight: '600',
+  },
+  customCatHint: {
+    fontSize: 11,
+    color: '#4F46E5',
+    marginTop: 6,
+    fontWeight: '500',
+  },
+
+  // Month Selector Bar
+  monthSelectorBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    marginBottom: 14,
+  },
+  monthArrowBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    backgroundColor: '#F1F5F9',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  monthCenterInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  monthCenterTitle: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  currentBadgeBtn: {
+    marginLeft: 8,
+    backgroundColor: '#EEF2FF',
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#C7D2FE',
+  },
+  currentBadgeText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#4F46E5',
+  },
+
+  // Monthly Charts Container Card
+  chartsCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    marginBottom: 16,
+  },
+  chartsCardTopRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  chartsCardTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  chartsCardSub: {
+    fontSize: 12,
+    color: '#64748B',
+    marginTop: 2,
+    fontWeight: '600',
+  },
+
+  // Chart Switcher Tabs
+  chartSwitcherRow: {
+    flexDirection: 'row',
+    backgroundColor: '#F1F5F9',
+    borderRadius: 10,
+    padding: 3,
+    marginBottom: 16,
+  },
+  chartSwitchBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 7,
+    borderRadius: 8,
+  },
+  chartSwitchBtnActive: {
+    backgroundColor: '#2563EB',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
+    elevation: 2,
+  },
+  chartSwitchBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#64748B',
+  },
+  chartSwitchBtnTextActive: {
+    color: '#FFFFFF',
+  },
+
+  // Empty Chart
+  chartEmptyCard: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 28,
+  },
+  chartEmptyTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#64748B',
+    marginTop: 8,
+  },
+  chartEmptySub: {
+    fontSize: 12,
+    color: '#94A3B8',
+    marginTop: 4,
+    textAlign: 'center',
+  },
+
+  // Pie Chart Styles
+  pieContainer: {
+    alignItems: 'center',
+    width: '100%',
+  },
+  svgRelativeWrap: {
+    width: 220,
+    height: 220,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+    marginVertical: 4,
+  },
+  donutCenterHole: {
+    position: 'absolute',
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  donutCenterCategory: {
+    fontSize: 10,
+    color: '#64748B',
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    textAlign: 'center',
+    maxWidth: 90,
+  },
+  donutCenterAmount: {
+    fontSize: 15,
+    fontWeight: '900',
+    color: '#0F172A',
+    textAlign: 'center',
+    maxWidth: 95,
+  },
+  donutCenterPercent: {
+    fontSize: 11,
+    color: '#2563EB',
+    fontWeight: '800',
+  },
+  donutCenterSub: {
+    fontSize: 10,
+    color: '#94A3B8',
+    fontWeight: '600',
+  },
+
+  // Spotlight card
+  spotlightCard: {
+    width: '100%',
+    backgroundColor: '#F8FAFC',
+    borderRadius: 12,
+    padding: 10,
+    borderWidth: 1.5,
+    marginTop: 10,
+  },
+  spotlightHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  spotlightDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  spotlightCategoryName: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  spotlightDetailsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 6,
+  },
+  spotlightTotal: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  spotlightWallets: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  spotlightWalletText: {
+    fontSize: 11,
+    color: '#475569',
+    fontWeight: '600',
+  },
+
+  // Pie Legend Chips
+  pieLegendRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    justifyContent: 'center',
+    marginTop: 14,
+    width: '100%',
+  },
+  pieLegendChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    maxWidth: '48%',
+  },
+  pieLegendDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    marginRight: 5,
+  },
+  pieLegendLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#334155',
+    flexShrink: 1,
+    marginRight: 4,
+  },
+  pieLegendPercent: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#64748B',
+  },
+
+  // Category Histogram Styles
+  histogramCardContainer: {
+    width: '100%',
+    paddingVertical: 4,
+  },
+  histogramSubHeader: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#475569',
+    marginBottom: 4,
+  },
+  catHistogramRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 4,
+  },
+  catHistCol: {
+    alignItems: 'center',
+    width: 64,
+  },
+  catHistValText: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: '#475569',
+    marginBottom: 4,
+  },
+  catHistBarWrapper: {
+    width: 24,
+    borderRadius: 6,
+    overflow: 'hidden',
+    backgroundColor: '#E2E8F0',
+    flexDirection: 'column',
+    justifyContent: 'flex-end',
+  },
+  catHistIconBadge: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 6,
+  },
+  catHistNameText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#1E293B',
+    marginTop: 2,
+    textAlign: 'center',
+    maxWidth: 60,
+  },
+  catHistPercentText: {
+    fontSize: 9,
+    fontWeight: '600',
+    color: '#64748B',
+  },
+  chartLegendFoot: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 16,
+    marginTop: 10,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#F1F5F9',
+  },
+
+  // Daily Histogram Styles
+  dailyHeaderMeta: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  dailyActiveCount: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#4F46E5',
+    backgroundColor: '#EEF2FF',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  dailyHistBarsRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+  dailyHistCol: {
+    alignItems: 'center',
+    width: 22,
+  },
+  dailyHistVal: {
+    fontSize: 8,
+    fontWeight: '700',
+    color: '#64748B',
+    marginBottom: 2,
+  },
+  dailyHistBarTrack: {
+    width: 14,
+    borderRadius: 4,
+    overflow: 'hidden',
+    flexDirection: 'column',
+    justifyContent: 'flex-end',
+  },
+  dailyHistDayLabel: {
+    fontSize: 9,
+    fontWeight: '600',
+    color: '#94A3B8',
+    marginTop: 4,
   },
 });

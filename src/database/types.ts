@@ -65,3 +65,11 @@ export interface AppSettings {
   currency: string; // strictly '₹'
   monthlyBudget: number; // 0 means not set
 }
+
+export interface DailySpend {
+  day: number;
+  date: string;
+  total: number;
+  cash: number;
+  upi: number;
+}

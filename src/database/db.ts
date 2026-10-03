@@ -6,6 +6,7 @@ import {
   WalletSummary,
   CategorySpend,
   MonthlySpend,
+  DailySpend,
   AppSettings,
   TransactionType,
   PaymentMethod,
@@ -181,6 +182,46 @@ export function getAllCategories(): Category[] {
 
   const db = getDatabase()!;
   return db.getAllSync<Category>('SELECT * FROM categories ORDER BY type ASC, name ASC;');
+}
+
+export function addCustomCategory(
+  name: string,
+  type: TransactionType,
+  icon = 'pricetag',
+  color?: string
+): Category {
+  const trimmed = name.trim();
+  const id = 'cat_custom_' + trimmed.toLowerCase().replace(/[^a-z0-9]/g, '_');
+  const customColors = ['#6366F1', '#EC4899', '#14B8A6', '#F59E0B', '#8B5CF6', '#06B6D4', '#10B981', '#F43F5E', '#D97706'];
+  const assignedColor =
+    color ||
+    customColors[
+      Math.abs(trimmed.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0)) % customColors.length
+    ];
+
+  if (IS_WEB) {
+    const cats = getWebStorage<Category[]>('exp_categories', DEFAULT_CATEGORIES);
+    const existing = cats.find((c) => c.name.toLowerCase() === trimmed.toLowerCase() && c.type === type);
+    if (existing) return existing;
+    const newCat: Category = { id, name: trimmed, icon, color: assignedColor, type };
+    cats.push(newCat);
+    setWebStorage('exp_categories', cats);
+    return newCat;
+  }
+
+  const db = getDatabase()!;
+  const existing = db.getFirstSync<Category>(
+    'SELECT * FROM categories WHERE LOWER(name) = LOWER(?) AND type = ?;',
+    [trimmed, type]
+  );
+  if (existing) return existing;
+
+  const newCat: Category = { id, name: trimmed, icon, color: assignedColor, type };
+  db.runSync(
+    'INSERT OR REPLACE INTO categories (id, name, icon, color, type) VALUES (?, ?, ?, ?, ?);',
+    [newCat.id, newCat.name, newCat.icon, newCat.color, newCat.type]
+  );
+  return newCat;
 }
 
 // ----------------- Transactions CRUD -----------------
@@ -553,6 +594,54 @@ export function getMonthlyTrends(monthsCount = 6): MonthlySpend[] {
 
     result.push({ month: yearMonth, label, expense, income, cashExpense, upiExpense });
   }
+
+  return result;
+}
+
+// ----------------- Daily Spend Histogram for Selected Month -----------------
+export function getDailySpendForMonth(month: string): DailySpend[] {
+  let allTx: Transaction[] = [];
+  if (IS_WEB) {
+    allTx = getWebStorage<Transaction[]>('exp_transactions', []);
+  } else {
+    const db = getDatabase()!;
+    allTx = db.getAllSync<Transaction>('SELECT * FROM transactions;');
+  }
+
+  const parts = month.split('-');
+  const year = parseInt(parts[0], 10) || new Date().getFullYear();
+  const monthNum = parseInt(parts[1], 10) || new Date().getMonth() + 1;
+  const daysInMonth = new Date(year, monthNum, 0).getDate();
+
+  const dailyMap = new Map<number, { total: number; cash: number; upi: number }>();
+  for (let i = 1; i <= daysInMonth; i++) {
+    dailyMap.set(i, { total: 0, cash: 0, upi: 0 });
+  }
+
+  for (const t of allTx) {
+    if (t.type === 'expense' && t.date && t.date.startsWith(month)) {
+      const day = parseInt(t.date.split('-')[2], 10);
+      if (day >= 1 && day <= daysInMonth) {
+        const cur = dailyMap.get(day) || { total: 0, cash: 0, upi: 0 };
+        cur.total += t.amount;
+        if (t.paymentMethod === 'cash') cur.cash += t.amount;
+        else cur.upi += t.amount;
+        dailyMap.set(day, cur);
+      }
+    }
+  }
+
+  const result: DailySpend[] = [];
+  dailyMap.forEach((val, day) => {
+    const padDay = String(day).padStart(2, '0');
+    result.push({
+      day,
+      date: `${month}-${padDay}`,
+      total: val.total,
+      cash: val.cash,
+      upi: val.upi,
+    });
+  });
 
   return result;
 }
