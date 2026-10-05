@@ -8,9 +8,16 @@ import {
   MonthlySpend,
   DailySpend,
   AppSettings,
+  CategoryLimitStatus,
   TransactionType,
   PaymentMethod,
 } from './types';
+import {
+  normalizeDateString,
+  getLocalDateString,
+  getLocalYearMonth,
+  pad2,
+} from '../utils/dateUtils';
 
 let dbInstance: SQLite.SQLiteDatabase | null = null;
 const IS_WEB = Platform.OS === 'web';
@@ -137,6 +144,45 @@ export function initDatabase(): void {
       insertCat.finalizeSync();
     }
   }
+
+  // Repair & sanitize any previously entered non-standard dates (e.g. DD-MM-YYYY)
+  sanitizeAllTransactionDates();
+}
+
+/**
+ * Sanitizes any existing transaction dates in database or web storage
+ * to strict YYYY-MM-DD format so they reflect in all monthly views and queries.
+ */
+export function sanitizeAllTransactionDates(): void {
+  try {
+    if (IS_WEB) {
+      const list = getWebStorage<Transaction[]>('exp_transactions', []);
+      let changed = false;
+      for (const t of list) {
+        const norm = normalizeDateString(t.date);
+        if (norm && norm !== t.date) {
+          t.date = norm;
+          changed = true;
+        }
+      }
+      if (changed) {
+        setWebStorage('exp_transactions', list);
+      }
+      return;
+    }
+
+    const db = getDatabase();
+    if (!db) return;
+    const rows = db.getAllSync<{ id: number; date: string }>('SELECT id, date FROM transactions;');
+    for (const r of rows) {
+      const norm = normalizeDateString(r.date);
+      if (norm && norm !== r.date) {
+        db.runSync('UPDATE transactions SET date = ? WHERE id = ?;', [norm, r.id]);
+      }
+    }
+  } catch (e) {
+    console.error('Failed to sanitize transaction dates:', e);
+  }
 }
 
 // ----------------- Settings -----------------
@@ -146,19 +192,22 @@ export function getAppSettings(): AppSettings {
     return {
       currency: '₹',
       monthlyBudget: s.monthlyBudget ? parseFloat(s.monthlyBudget) || 0 : 0,
+      categoryLimitsEnabled: s.categoryLimitsEnabled === 'true',
     };
   }
 
   const db = getDatabase()!;
   const budgetRow = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'monthlyBudget';");
+  const limitsRow = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'categoryLimitsEnabled';");
 
   return {
     currency: '₹',
     monthlyBudget: budgetRow ? parseFloat(budgetRow.value) || 0 : 0,
+    categoryLimitsEnabled: limitsRow?.value === 'true',
   };
 }
 
-export function saveAppSetting(key: 'monthlyBudget', value: string): void {
+export function saveAppSetting(key: 'monthlyBudget' | 'categoryLimitsEnabled', value: string): void {
   if (IS_WEB) {
     const s = getWebStorage<Record<string, string>>('exp_settings', {});
     s[key] = value;
@@ -171,6 +220,167 @@ export function saveAppSetting(key: 'monthlyBudget', value: string): void {
     'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;',
     [key, value]
   );
+}
+
+// ----------------- Category Limits -----------------
+export function getCategoryLimits(): Record<string, number> {
+  if (IS_WEB) {
+    const s = getWebStorage<Record<string, string>>('exp_settings', {});
+    try {
+      return s.category_limits ? JSON.parse(s.category_limits) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  const db = getDatabase()!;
+  const row = db.getFirstSync<{ value: string }>(
+    "SELECT value FROM settings WHERE key = 'category_limits';"
+  );
+  if (!row || !row.value) return {};
+  try {
+    return JSON.parse(row.value);
+  } catch {
+    return {};
+  }
+}
+
+export function saveCategoryLimits(limits: Record<string, number>): void {
+  const jsonStr = JSON.stringify(limits);
+  if (IS_WEB) {
+    const s = getWebStorage<Record<string, string>>('exp_settings', {});
+    s.category_limits = jsonStr;
+    setWebStorage('exp_settings', s);
+    return;
+  }
+
+  const db = getDatabase()!;
+  db.runSync(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;',
+    ['category_limits', jsonStr]
+  );
+}
+
+export function setCategoryLimit(categoryName: string, limit: number): void {
+  const trimmed = categoryName.trim();
+  if (!trimmed) return;
+
+  // Ensure category exists in categories table so it shows up in expense categories
+  const allCats = getAllCategories();
+  const existing = allCats.find((c) => c.name.toLowerCase() === trimmed.toLowerCase() && c.type === 'expense');
+  if (!existing) {
+    let icon = 'pricetag';
+    let color = '#3B82F6';
+    const lower = trimmed.toLowerCase();
+    if (lower.includes('food') || lower.includes('dining') || lower.includes('snack') || lower.includes('eat')) {
+      icon = 'restaurant';
+      color = '#F97316';
+    } else if (lower.includes('petrol') || lower.includes('fuel') || lower.includes('cab') || lower.includes('auto') || lower.includes('diesel')) {
+      icon = 'car';
+      color = '#2563EB';
+    } else if (lower.includes('service') || lower.includes('repair') || lower.includes('maintenance')) {
+      icon = 'construct';
+      color = '#8B5CF6';
+    } else if (lower.includes('grocery') || lower.includes('kirana') || lower.includes('market')) {
+      icon = 'cart';
+      color = '#10B981';
+    } else if (lower.includes('bill') || lower.includes('electric') || lower.includes('recharge')) {
+      icon = 'flash';
+      color = '#EF4444';
+    }
+    addCustomCategory(trimmed, 'expense', icon, color);
+  }
+
+  const currentLimits = getCategoryLimits();
+  currentLimits[trimmed] = limit;
+  saveCategoryLimits(currentLimits);
+}
+
+export function deleteCategoryLimit(categoryName: string): void {
+  const trimmed = categoryName.trim();
+  const currentLimits = getCategoryLimits();
+  const targetKey = Object.keys(currentLimits).find(
+    (k) => k.toLowerCase() === trimmed.toLowerCase()
+  );
+  if (targetKey) {
+    delete currentLimits[targetKey];
+  } else {
+    delete currentLimits[trimmed];
+  }
+  saveCategoryLimits(currentLimits);
+}
+
+export function getCategoryMonthlySpend(categoryName: string, month?: string): number {
+  const targetMonth = month || getLocalYearMonth();
+  const catLower = categoryName.trim().toLowerCase();
+
+  if (IS_WEB) {
+    const list = getWebStorage<Transaction[]>('exp_transactions', []);
+    return list
+      .filter((t) => {
+        if (t.type !== 'expense' || !t.date.startsWith(targetMonth)) return false;
+        const tCat = t.category.toLowerCase();
+        return (
+          tCat === catLower ||
+          (catLower === 'food' && tCat.includes('food')) ||
+          (catLower === 'petrol' && tCat.includes('petrol')) ||
+          (catLower === 'service' && tCat.includes('service')) ||
+          (catLower.includes('food') && tCat === 'food') ||
+          (catLower.includes('petrol') && tCat === 'petrol') ||
+          (catLower.includes('service') && tCat === 'service')
+        );
+      })
+      .reduce((sum, t) => sum + t.amount, 0);
+  }
+
+  const db = getDatabase()!;
+  const row = db.getFirstSync<{ total: number }>(
+    `SELECT COALESCE(SUM(amount), 0) as total FROM transactions 
+     WHERE type = 'expense' 
+       AND date LIKE $month 
+       AND (
+         LOWER(category) = $cat 
+         OR ($cat = 'food' AND LOWER(category) LIKE '%food%')
+         OR ($cat = 'petrol' AND LOWER(category) LIKE '%petrol%')
+         OR ($cat = 'service' AND LOWER(category) LIKE '%service%')
+         OR ($cat LIKE '%food%' AND LOWER(category) = 'food')
+         OR ($cat LIKE '%petrol%' AND LOWER(category) = 'petrol')
+         OR ($cat LIKE '%service%' AND LOWER(category) = 'service')
+       );`,
+    {
+      $month: `${targetMonth}%`,
+      $cat: catLower,
+    }
+  );
+  return row ? row.total : 0;
+}
+
+export function getAllCategoryLimitStatuses(month?: string): CategoryLimitStatus[] {
+  const limits = getCategoryLimits();
+  const categories = getAllCategories();
+  const targetMonth = month || getLocalYearMonth();
+
+  const result: CategoryLimitStatus[] = [];
+  for (const [catName, limit] of Object.entries(limits)) {
+    if (limit <= 0) continue;
+    const spent = getCategoryMonthlySpend(catName, targetMonth);
+    const remaining = limit - spent;
+    const percent = Math.min(Math.round((spent / limit) * 100), 999);
+    const matchCat = categories.find((c) => c.name.toLowerCase() === catName.toLowerCase());
+
+    result.push({
+      category: catName,
+      limit,
+      spent,
+      remaining,
+      percent,
+      isOverLimit: remaining < 0,
+      color: matchCat?.color || '#2563EB',
+      icon: matchCat?.icon || 'pricetag',
+    });
+  }
+
+  return result.sort((a, b) => b.percent - a.percent);
 }
 
 // ----------------- Categories -----------------
@@ -226,7 +436,7 @@ export function addCustomCategory(
 
 // ----------------- Transactions CRUD -----------------
 export function getTransactions(options?: {
-  month?: string; // YYYY-MM
+  month?: string; // YYYY-MM or 'all'
   type?: TransactionType;
   category?: string;
   paymentMethod?: PaymentMethod;
@@ -236,7 +446,7 @@ export function getTransactions(options?: {
   if (IS_WEB) {
     let list = getWebStorage<Transaction[]>('exp_transactions', []);
 
-    if (options?.month) {
+    if (options?.month && options.month !== 'all') {
       list = list.filter((t) => t.date.startsWith(options.month!));
     }
     if (options?.type) {
@@ -266,7 +476,7 @@ export function getTransactions(options?: {
   let query = 'SELECT * FROM transactions WHERE 1=1';
   const params: Record<string, string | number> = {};
 
-  if (options?.month) {
+  if (options?.month && options.month !== 'all') {
     query += ' AND date LIKE $month';
     params.$month = `${options.month}%`;
   }
@@ -314,6 +524,7 @@ export function addTransaction(data: {
 }): Transaction {
   const createdAt = new Date().toISOString();
   const method: PaymentMethod = data.paymentMethod === 'cash' ? 'cash' : 'upi';
+  const normDate = normalizeDateString(data.date) || getLocalDateString();
 
   if (IS_WEB) {
     const list = getWebStorage<Transaction[]>('exp_transactions', []);
@@ -327,7 +538,7 @@ export function addTransaction(data: {
       categoryIcon: data.categoryIcon || 'pricetag',
       categoryColor: data.categoryColor || '#64748B',
       paymentMethod: method,
-      date: data.date,
+      date: normDate,
       notes: data.notes ? data.notes.trim() : '',
       createdAt,
     };
@@ -348,7 +559,7 @@ export function addTransaction(data: {
       data.categoryIcon || 'pricetag',
       data.categoryColor || '#64748B',
       method,
-      data.date,
+      normDate,
       data.notes ? data.notes.trim() : '',
       createdAt,
     ]
@@ -363,7 +574,7 @@ export function addTransaction(data: {
     categoryIcon: data.categoryIcon,
     categoryColor: data.categoryColor,
     paymentMethod: method,
-    date: data.date,
+    date: normDate,
     notes: data.notes,
     createdAt,
   };
@@ -384,6 +595,7 @@ export function updateTransaction(
   }
 ): void {
   const method: PaymentMethod = data.paymentMethod === 'cash' ? 'cash' : 'upi';
+  const normDate = normalizeDateString(data.date) || getLocalDateString();
 
   if (IS_WEB) {
     const list = getWebStorage<Transaction[]>('exp_transactions', []);
@@ -398,7 +610,7 @@ export function updateTransaction(
         categoryIcon: data.categoryIcon || 'pricetag',
         categoryColor: data.categoryColor || '#64748B',
         paymentMethod: method,
-        date: data.date,
+        date: normDate,
         notes: data.notes ? data.notes.trim() : '',
       };
       setWebStorage('exp_transactions', list);
@@ -419,7 +631,7 @@ export function updateTransaction(
       data.categoryIcon || 'pricetag',
       data.categoryColor || '#64748B',
       method,
-      data.date,
+      normDate,
       data.notes ? data.notes.trim() : '',
       id,
     ]
@@ -446,14 +658,14 @@ export function getWalletSummary(month?: string): WalletSummary {
 
   if (IS_WEB) {
     transactions = getWebStorage<Transaction[]>('exp_transactions', []);
-    if (month) {
+    if (month && month !== 'all') {
       transactions = transactions.filter((t) => t.date.startsWith(month));
     }
   } else {
     const db = getDatabase()!;
     let query = 'SELECT * FROM transactions WHERE 1=1';
     const params: Record<string, string> = {};
-    if (month) {
+    if (month && month !== 'all') {
       query += ' AND date LIKE $month';
       params.$month = `${month}%`;
     }
@@ -510,7 +722,7 @@ export function getCategoryBreakdown(month?: string): CategorySpend[] {
   }
 
   list = list.filter((t) => t.type === 'expense');
-  if (month) {
+  if (month && month !== 'all') {
     list = list.filter((t) => t.date.startsWith(month));
   }
 
@@ -571,8 +783,10 @@ export function getMonthlyTrends(monthsCount = 6): MonthlySpend[] {
   }
 
   for (let i = monthsCount - 1; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    const yearMonth = d.toISOString().slice(0, 7);
+    const y = now.getFullYear();
+    const m = now.getMonth() - i;
+    const d = new Date(y, m, 1);
+    const yearMonth = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
     const label = d.toLocaleString('en-IN', { month: 'short' });
 
     let expense = 0;
@@ -608,7 +822,8 @@ export function getDailySpendForMonth(month: string): DailySpend[] {
     allTx = db.getAllSync<Transaction>('SELECT * FROM transactions;');
   }
 
-  const parts = month.split('-');
+  const effectiveMonth = month === 'all' ? getLocalYearMonth() : month;
+  const parts = effectiveMonth.split('-');
   const year = parseInt(parts[0], 10) || new Date().getFullYear();
   const monthNum = parseInt(parts[1], 10) || new Date().getMonth() + 1;
   const daysInMonth = new Date(year, monthNum, 0).getDate();
@@ -619,7 +834,7 @@ export function getDailySpendForMonth(month: string): DailySpend[] {
   }
 
   for (const t of allTx) {
-    if (t.type === 'expense' && t.date && t.date.startsWith(month)) {
+    if (t.type === 'expense' && t.date && t.date.startsWith(effectiveMonth)) {
       const day = parseInt(t.date.split('-')[2], 10);
       if (day >= 1 && day <= daysInMonth) {
         const cur = dailyMap.get(day) || { total: 0, cash: 0, upi: 0 };
@@ -636,7 +851,7 @@ export function getDailySpendForMonth(month: string): DailySpend[] {
     const padDay = String(day).padStart(2, '0');
     result.push({
       day,
-      date: `${month}-${padDay}`,
+      date: `${effectiveMonth}-${padDay}`,
       total: val.total,
       cash: val.cash,
       upi: val.upi,

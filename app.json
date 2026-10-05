@@ -2,7 +2,7 @@
   "expo": {
     "name": "Expense Tracker",
     "slug": "santa-expense-tracker",
-    "version": "1.0.0",
+    "version": "1.2.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -11,8 +11,9 @@
     },
     "android": {
       "package": "com.santa.expensetracker",
+      "versionCode": 2,
       "adaptiveIcon": {
-        "backgroundColor": "#0A4338",
+        "backgroundColor": "#FFFFFF",
         "foregroundImage": "./assets/android-icon-foreground.png"
       },
       "predictiveBackGestureEnabled": false

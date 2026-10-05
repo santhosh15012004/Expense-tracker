@@ -64,6 +64,18 @@ export interface MonthlySpend {
 export interface AppSettings {
   currency: string; // strictly '₹'
   monthlyBudget: number; // 0 means not set
+  categoryLimitsEnabled?: boolean;
+}
+
+export interface CategoryLimitStatus {
+  category: string;
+  limit: number;
+  spent: number;
+  remaining: number;
+  percent: number;
+  isOverLimit: boolean;
+  color?: string;
+  icon?: string;
 }
 
 export interface DailySpend {

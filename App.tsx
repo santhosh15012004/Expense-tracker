@@ -12,6 +12,8 @@ import {
   SafeAreaView,
   Platform,
   Image,
+  KeyboardAvoidingView,
+  Keyboard,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { G, Path, Circle, Rect, Text as SvgText } from 'react-native-svg';
@@ -30,6 +32,9 @@ import {
   getAppSettings,
   saveAppSetting,
   resetAllData,
+  setCategoryLimit,
+  deleteCategoryLimit,
+  getAllCategoryLimitStatuses,
 } from './src/database/db';
 import {
   Transaction,
@@ -39,10 +44,24 @@ import {
   MonthlySpend,
   DailySpend,
   AppSettings,
+  CategoryLimitStatus,
   TransactionType,
   PaymentMethod,
 } from './src/database/types';
-import { exportBackupToFile, exportToSpreadsheetCSV, restoreBackup } from './src/utils/backup';
+import { exportToSpreadsheetCSV, restoreBackup } from './src/utils/backup';
+import { downloadMonthlyPdf } from './src/utils/pdfReport';
+import {
+  getLocalDateString,
+  getLocalYearMonth,
+  getTodayDateString,
+  getYesterdayDateString,
+  getDaysAgoDateString,
+  normalizeDateString,
+  formatDateDisplay,
+  formatMonthDisplay,
+  getShiftedMonth,
+  pad2,
+} from './src/utils/dateUtils';
 
 type TabType = 'home' | 'analytics' | 'history' | 'settings';
 type ChartMode = 'pie' | 'categoryBars' | 'dailyHistogram';
@@ -101,7 +120,9 @@ function PieChartComponent({
   const outerR = 92;
   const innerR = 54;
 
-  if (data.length === 0 || totalAmount <= 0) {
+  const validData = useMemo(() => data.filter((d) => d && d.total > 0), [data]);
+
+  if (validData.length === 0 || totalAmount <= 0) {
     return (
       <View style={styles.chartEmptyCard}>
         <Ionicons name="pie-chart-outline" size={44} color="#94A3B8" />
@@ -112,8 +133,8 @@ function PieChartComponent({
   }
 
   let cumulative = 0;
-  const slices = data.map((item, index) => {
-    const fraction = item.total / totalAmount;
+  const slices = validData.map((item, index) => {
+    const fraction = totalAmount > 0 ? item.total / totalAmount : 0;
     const startPercent = cumulative;
     cumulative += fraction;
     const endPercent = cumulative;
@@ -126,7 +147,7 @@ function PieChartComponent({
     };
   });
 
-  const selectedItem = selectedIndex !== null ? data[selectedIndex] : null;
+  const selectedItem = selectedIndex !== null ? validData[selectedIndex] : null;
 
   return (
     <View style={styles.pieContainer}>
@@ -137,6 +158,12 @@ function PieChartComponent({
               const isSelected = selectedIndex === slice.index;
               const isSingle = slice.fraction >= 0.999;
               const sliceR = isSelected ? outerR + 5 : outerR;
+              const sliceColor = slice.item.color || '#3B82F6';
+              const handleSelect = () => onSelectIndex(isSelected ? null : slice.index);
+              const interactiveProps =
+                Platform.OS === 'web'
+                  ? { onClick: handleSelect, cursor: 'pointer' as any }
+                  : { onPress: handleSelect };
 
               if (isSingle) {
                 return (
@@ -145,10 +172,10 @@ function PieChartComponent({
                     cx={cx}
                     cy={cy}
                     r={(outerR + innerR) / 2}
-                    stroke={slice.item.color}
+                    stroke={sliceColor}
                     strokeWidth={outerR - innerR + (isSelected ? 6 : 0)}
                     fill="none"
-                    onPress={() => onSelectIndex(isSelected ? null : slice.index)}
+                    {...interactiveProps}
                   />
                 );
               }
@@ -166,10 +193,10 @@ function PieChartComponent({
                 <Path
                   key={slice.index}
                   d={pathData}
-                  fill={slice.item.color}
+                  fill={sliceColor}
                   stroke="#FFFFFF"
                   strokeWidth={2}
-                  onPress={() => onSelectIndex(isSelected ? null : slice.index)}
+                  {...interactiveProps}
                 />
               );
             })}
@@ -187,17 +214,17 @@ function PieChartComponent({
           {selectedItem ? (
             <Text style={styles.donutCenterPercent}>{selectedItem.percentage}%</Text>
           ) : (
-            <Text style={styles.donutCenterSub}>{data.length} categories</Text>
+            <Text style={styles.donutCenterSub}>{validData.length} categories</Text>
           )}
         </View>
       </View>
 
       {/* Selected Item Spotlight Card */}
       {selectedItem && (
-        <View style={[styles.spotlightCard, { borderColor: selectedItem.color }]}>
+        <View style={[styles.spotlightCard, { borderColor: selectedItem.color || '#3B82F6' }]}>
           <View style={styles.spotlightHeader}>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-              <View style={[styles.spotlightDot, { backgroundColor: selectedItem.color }]} />
+              <View style={[styles.spotlightDot, { backgroundColor: selectedItem.color || '#3B82F6' }]} />
               <Text style={styles.spotlightCategoryName}>{selectedItem.category}</Text>
             </View>
             <TouchableOpacity onPress={() => onSelectIndex(null)}>
@@ -222,18 +249,19 @@ function PieChartComponent({
 
       {/* Legend Chips Grid */}
       <View style={styles.pieLegendRow}>
-        {data.map((cat, idx) => {
+        {validData.map((cat, idx) => {
           const isSelected = selectedIndex === idx;
+          const chipColor = cat.color || '#3B82F6';
           return (
             <TouchableOpacity
               key={idx}
               style={[
                 styles.pieLegendChip,
-                isSelected && { backgroundColor: cat.color + '22', borderColor: cat.color },
+                isSelected && { backgroundColor: chipColor + '22', borderColor: chipColor },
               ]}
               onPress={() => onSelectIndex(isSelected ? null : idx)}
             >
-              <View style={[styles.pieLegendDot, { backgroundColor: cat.color }]} />
+              <View style={[styles.pieLegendDot, { backgroundColor: chipColor }]} />
               <Text style={styles.pieLegendLabel} numberOfLines={1}>
                 {cat.category}
               </Text>
@@ -406,8 +434,21 @@ export default function App() {
 
   // App Data State
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [wallet, setWallet] = useState<WalletSummary>({
+    cashBalance: 0,
+    cashIncome: 0,
+    cashExpense: 0,
+    upiBalance: 0,
+    upiIncome: 0,
+    upiExpense: 0,
+    totalBalance: 0,
+    totalIncome: 0,
+    totalExpense: 0,
+    transactionCount: 0,
+  });
+  const [allTimeWallet, setAllTimeWallet] = useState<WalletSummary>({
     cashBalance: 0,
     cashIncome: 0,
     cashExpense: 0,
@@ -424,8 +465,10 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>({ currency: '₹', monthlyBudget: 0 });
 
   // Filters & Search
-  const currentMonthStr = useMemo(() => new Date().toISOString().slice(0, 7), []);
+  const currentMonthStr = useMemo(() => getLocalYearMonth(), []);
   const [selectedMonth, setSelectedMonth] = useState<string>(currentMonthStr);
+  const [dashboardView, setDashboardView] = useState<'all' | 'month'>('all');
+  const [historyPeriodFilter, setHistoryPeriodFilter] = useState<'all' | 'month'>('all');
   const [historyTypeFilter, setHistoryTypeFilter] = useState<'all' | 'expense' | 'income'>('all');
   const [historyWalletFilter, setHistoryWalletFilter] = useState<'all' | 'cash' | 'upi'>('all');
   const [historySearch, setHistorySearch] = useState('');
@@ -439,8 +482,12 @@ export default function App() {
   const [amount, setAmount] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<Category | null>(null);
   const [customCategoryInput, setCustomCategoryInput] = useState('');
-  const [txDate, setTxDate] = useState(new Date().toISOString().split('T')[0]);
+  const [txDate, setTxDate] = useState(getTodayDateString());
   const [notes, setNotes] = useState('');
+
+  // Calendar Date Picker Modal State
+  const [calendarModalVisible, setCalendarModalVisible] = useState(false);
+  const [calendarMonth, setCalendarMonth] = useState(getLocalYearMonth());
 
   // Monthly Analytics Chart State
   const [dailySpends, setDailySpends] = useState<DailySpend[]>([]);
@@ -452,28 +499,107 @@ export default function App() {
   const [restoreModalVisible, setRestoreModalVisible] = useState(false);
   const [restoreJsonInput, setRestoreJsonInput] = useState('');
 
-  // Month Navigation
-  const formatMonthDisplay = (monthStr: string) => {
-    const parts = monthStr.split('-');
-    const date = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, 1);
-    return date.toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+  // PDF Statement State
+  const [pdfModalVisible, setPdfModalVisible] = useState(false);
+  const [pdfExportMonth, setPdfExportMonth] = useState(currentMonthStr);
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+
+  const openPdfModal = (monthToOpen?: string) => {
+    setPdfExportMonth(monthToOpen || selectedMonth || currentMonthStr);
+    setPdfModalVisible(true);
   };
 
+  const handleDownloadMonthlyPdf = async (targetMonth?: string) => {
+    const monthToUse = targetMonth || pdfExportMonth || selectedMonth;
+    try {
+      setIsGeneratingPdf(true);
+      const monthSummary = getWalletSummary(monthToUse);
+      const monthTransactions = getTransactions({ month: monthToUse });
+      const incTxs = monthTransactions.filter((t) => t.type === 'income');
+      const expTxs = monthTransactions.filter((t) => t.type === 'expense');
+      const catBreakdown = getCategoryBreakdown(monthToUse);
+
+      const result = await downloadMonthlyPdf({
+        month: monthToUse,
+        summary: monthSummary,
+        incomeTransactions: incTxs,
+        expenseTransactions: expTxs,
+        categoryBreakdown: catBreakdown,
+      });
+
+      if (result.success) {
+        if (Platform.OS === 'web') {
+          Alert.alert('PDF Ready', result.message);
+        }
+      } else {
+        Alert.alert('Notice', result.message);
+      }
+    } catch (err: any) {
+      Alert.alert('PDF Generation Failed', err?.message || 'Could not generate monthly PDF statement.');
+    } finally {
+      setIsGeneratingPdf(false);
+    }
+  };
+
+  // Category Monthly Limits State
+  const [categoryLimitsEnabled, setCategoryLimitsEnabled] = useState(false);
+  const [categoryLimitStatuses, setCategoryLimitStatuses] = useState<CategoryLimitStatus[]>([]);
+  const [limitModalVisible, setLimitModalVisible] = useState(false);
+  const [limitCategoryName, setLimitCategoryName] = useState('');
+  const [limitAmountInput, setLimitAmountInput] = useState('');
+
+  const handleToggleCategoryLimits = () => {
+    const nextVal = !categoryLimitsEnabled;
+    setCategoryLimitsEnabled(nextVal);
+    saveAppSetting('categoryLimitsEnabled', String(nextVal));
+  };
+
+  const handleSaveCategoryLimit = (catName?: string, limitAmount?: number) => {
+    const nameToSave = (catName || limitCategoryName).trim();
+    const amtToSave = limitAmount !== undefined ? limitAmount : parseFloat(limitAmountInput);
+
+    if (!nameToSave) {
+      Alert.alert('Category Name Required', 'Please choose or type a category name.');
+      return;
+    }
+    if (isNaN(amtToSave) || amtToSave <= 0) {
+      Alert.alert('Invalid Limit', 'Please enter a valid monthly limit amount greater than ₹0.');
+      return;
+    }
+
+    setCategoryLimit(nameToSave, amtToSave);
+    setLimitModalVisible(false);
+    setLimitCategoryName('');
+    setLimitAmountInput('');
+    loadAllData();
+  };
+
+  const handleDeleteCategoryLimit = (catName: string) => {
+    Alert.alert(
+      'Remove Category Limit',
+      `Are you sure you want to remove the monthly limit for ${catName}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: () => {
+            deleteCategoryLimit(catName);
+            loadAllData();
+          },
+        },
+      ]
+    );
+  };
+
+  // Month Navigation (Timezone-safe)
   const handlePrevMonth = () => {
-    const parts = selectedMonth.split('-');
-    const y = parseInt(parts[0], 10);
-    const m = parseInt(parts[1], 10);
-    const d = new Date(y, m - 2, 1);
-    setSelectedMonth(d.toISOString().slice(0, 7));
+    setSelectedMonth((prev) => getShiftedMonth(prev, -1));
     setSelectedSliceIndex(null);
   };
 
   const handleNextMonth = () => {
-    const parts = selectedMonth.split('-');
-    const y = parseInt(parts[0], 10);
-    const m = parseInt(parts[1], 10);
-    const d = new Date(y, m, 1);
-    setSelectedMonth(d.toISOString().slice(0, 7));
+    setSelectedMonth((prev) => getShiftedMonth(prev, 1));
     setSelectedSliceIndex(null);
   };
 
@@ -488,24 +614,40 @@ export default function App() {
       const appSettings = getAppSettings();
       setSettings(appSettings);
       setBudgetInput(appSettings.monthlyBudget > 0 ? String(appSettings.monthlyBudget) : '');
+      setCategoryLimitsEnabled(!!appSettings.categoryLimitsEnabled);
+      const catStatuses = getAllCategoryLimitStatuses(selectedMonth);
+      setCategoryLimitStatuses(catStatuses);
 
       const cats = getAllCategories();
       setCategories(cats);
 
+      // 1. All-time wallet summary (real cumulative balance of cash and UPI)
+      const allSumm = getWalletSummary();
+      setAllTimeWallet(allSumm);
+
+      // 2. Selected month wallet summary
       const summ = getWalletSummary(selectedMonth);
       setWallet(summ);
 
+      // 3. Category breakdown
       const breakdown = getCategoryBreakdown(selectedMonth);
       setCategoryBreakdown(breakdown);
 
+      // 4. Daily histogram
       const daily = getDailySpendForMonth(selectedMonth);
       setDailySpends(daily);
 
+      // 5. 6-month trends
       const trends = getMonthlyTrends(6);
       setMonthlyTrends(trends);
 
+      // 6. 5 most recent transactions across all dates (for Dashboard)
+      const recent = getTransactions({ limit: 5 });
+      setRecentTransactions(recent);
+
+      // 7. Transactions list for History tab
       const txs = getTransactions({
-        month: selectedMonth,
+        month: historyPeriodFilter === 'month' ? selectedMonth : undefined,
         type: historyTypeFilter === 'all' ? undefined : historyTypeFilter,
         paymentMethod: historyWalletFilter === 'all' ? undefined : historyWalletFilter,
         search: historySearch,
@@ -514,7 +656,7 @@ export default function App() {
     } catch (e: any) {
       Alert.alert('Database Error', e?.message || 'Failed to load local data');
     }
-  }, [selectedMonth, historyTypeFilter, historyWalletFilter, historySearch]);
+  }, [selectedMonth, historyPeriodFilter, historyTypeFilter, historyWalletFilter, historySearch]);
 
   useEffect(() => {
     initDatabase();
@@ -530,7 +672,7 @@ export default function App() {
     setAmount('');
     setNotes('');
     setCustomCategoryInput('');
-    setTxDate(new Date().toISOString().split('T')[0]);
+    setTxDate(getTodayDateString());
 
     const matchingCat = categories.find((c) => c.type === type) || categories[0] || null;
     setSelectedCategory(matchingCat);
@@ -568,6 +710,49 @@ export default function App() {
     setModalVisible(true);
   };
 
+  // Active category limit status for the selected category in Add Modal
+  const activeLimitStatus = useMemo(() => {
+    if (!categoryLimitsEnabled || txType !== 'expense') return null;
+    const catName =
+      selectedCategory?.name?.toLowerCase().includes('other') && customCategoryInput.trim()
+        ? customCategoryInput.trim()
+        : selectedCategory?.name || '';
+    if (!catName) return null;
+
+    const lower = catName.toLowerCase();
+    return (
+      categoryLimitStatuses.find(
+        (s) =>
+          s.category.toLowerCase() === lower ||
+          (lower === 'food' && s.category.toLowerCase().includes('food')) ||
+          (lower.includes('food') && s.category.toLowerCase() === 'food') ||
+          (lower === 'petrol' && s.category.toLowerCase().includes('petrol')) ||
+          (lower.includes('petrol') && s.category.toLowerCase() === 'petrol') ||
+          (lower === 'service' && s.category.toLowerCase().includes('service')) ||
+          (lower.includes('service') && s.category.toLowerCase() === 'service')
+      ) || null
+    );
+  }, [categoryLimitsEnabled, txType, selectedCategory, customCategoryInput, categoryLimitStatuses]);
+
+  const enteredAmountNum = parseFloat(amount) || 0;
+  const editingAdjustment =
+    editingTransaction &&
+    editingTransaction.type === 'expense' &&
+    activeLimitStatus &&
+    editingTransaction.category.toLowerCase() === activeLimitStatus.category.toLowerCase()
+      ? editingTransaction.amount
+      : 0;
+
+  const currentSpentAdjusted = activeLimitStatus
+    ? Math.max(0, activeLimitStatus.spent - editingAdjustment)
+    : 0;
+  const remainingAfterAmount = activeLimitStatus
+    ? activeLimitStatus.limit - currentSpentAdjusted - enteredAmountNum
+    : 0;
+  const calculatedUsedPercent = activeLimitStatus
+    ? Math.round(((currentSpentAdjusted + enteredAmountNum) / activeLimitStatus.limit) * 100)
+    : 0;
+
   const handleTypeChange = (newType: TransactionType) => {
     setTxType(newType);
     setCustomCategoryInput('');
@@ -593,6 +778,15 @@ export default function App() {
       return;
     }
 
+    const normDate = normalizeDateString(txDate);
+    if (!normDate) {
+      Alert.alert(
+        'Invalid Date',
+        'Please enter a valid date.\nAccepted formats:\n• YYYY-MM-DD (e.g. 2026-10-02)\n• DD-MM-YYYY (e.g. 02-10-2026)\n• Or tap Yesterday / Calendar button'
+      );
+      return;
+    }
+
     try {
       const isOther =
         selectedCategory.name.toLowerCase().includes('other') ||
@@ -613,7 +807,7 @@ export default function App() {
           categoryIcon: finalCategory.icon,
           categoryColor: finalCategory.color,
           paymentMethod,
-          date: txDate,
+          date: normDate,
           notes: notes.trim(),
         });
       } else {
@@ -625,9 +819,15 @@ export default function App() {
           categoryIcon: finalCategory.icon,
           categoryColor: finalCategory.color,
           paymentMethod,
-          date: txDate,
+          date: normDate,
           notes: notes.trim(),
         });
+      }
+
+      // Automatically sync selectedMonth if user logged an entry for another month
+      const txMonth = normDate.slice(0, 7);
+      if (selectedMonth !== txMonth) {
+        setSelectedMonth(txMonth);
       }
 
       setModalVisible(false);
@@ -716,6 +916,59 @@ export default function App() {
     return max;
   }, [monthlyTrends]);
 
+  // Calendar Grid Days Builder for Date Picker
+  const renderCalendarDays = (
+    monthStr: string,
+    currentSelectedDate: string,
+    onSelectDate: (d: string) => void
+  ) => {
+    const parts = monthStr.split('-');
+    const year = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10);
+    const firstDayIndex = new Date(year, month - 1, 1).getDay(); // 0 = Sun
+    const daysInMonth = new Date(year, month, 0).getDate();
+    const todayStr = getTodayDateString();
+    const normSelected = normalizeDateString(currentSelectedDate);
+
+    const cells = [];
+    // Blank slots for days before 1st of month
+    for (let i = 0; i < firstDayIndex; i++) {
+      cells.push(<View key={`blank-${i}`} style={styles.calendarDayCell} />);
+    }
+
+    // Days 1..daysInMonth
+    for (let day = 1; day <= daysInMonth; day++) {
+      const dateStr = `${year}-${pad2(month)}-${pad2(day)}`;
+      const isSelected = normSelected === dateStr;
+      const isToday = todayStr === dateStr;
+
+      cells.push(
+        <TouchableOpacity
+          key={`day-${day}`}
+          style={[
+            styles.calendarDayCell,
+            styles.calendarDayCellActiveBtn,
+            isSelected && styles.calendarDaySelected,
+            isToday && !isSelected && styles.calendarDayToday,
+          ]}
+          onPress={() => onSelectDate(dateStr)}
+        >
+          <Text
+            style={[
+              styles.calendarDayText,
+              isSelected && styles.calendarDaySelectedText,
+              isToday && !isSelected && styles.calendarDayTodayText,
+            ]}
+          >
+            {day}
+          </Text>
+        </TouchableOpacity>
+      );
+    }
+
+    return cells;
+  };
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
@@ -738,8 +991,12 @@ export default function App() {
           </View>
 
           <View style={styles.headerRightActions}>
-            <TouchableOpacity style={styles.headerIconButton} onPress={() => exportBackupToFile()}>
-              <Ionicons name="share-outline" size={18} color="#334155" />
+            <TouchableOpacity
+              style={styles.headerIconButton}
+              onPress={() => openPdfModal(selectedMonth)}
+              accessibilityLabel="Download Monthly Statement PDF"
+            >
+              <Ionicons name="document-text-outline" size={20} color="#2563EB" />
             </TouchableOpacity>
           </View>
         </View>
@@ -752,39 +1009,113 @@ export default function App() {
               {/* Total Combined Net Balance */}
               <View style={styles.totalBalanceCard}>
                 <View style={styles.cardHeaderRow}>
-                  <Text style={styles.totalBalanceLabel}>TOTAL NET BALANCE</Text>
-                  <View style={styles.monthBadge}>
-                    <Ionicons name="calendar-outline" size={12} color="#64748B" />
-                    <Text style={styles.monthBadgeText}>{selectedMonth}</Text>
+                  <Text style={styles.totalBalanceLabel} numberOfLines={1}>
+                    {dashboardView === 'all' ? 'TOTAL BALANCE' : 'NET CASHFLOW'}
+                  </Text>
+                  
+                  {/* Period Switcher: All Time vs Selected Month */}
+                  <View style={styles.dashboardViewToggle}>
+                    <TouchableOpacity
+                      style={[
+                        styles.dashboardTogglePill,
+                        dashboardView === 'all' && styles.dashboardTogglePillActive,
+                      ]}
+                      onPress={() => setDashboardView('all')}
+                    >
+                      <Text
+                        style={[
+                          styles.dashboardToggleText,
+                          dashboardView === 'all' && styles.dashboardToggleTextActive,
+                        ]}
+                      >
+                        All Time
+                      </Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={[
+                        styles.dashboardTogglePill,
+                        dashboardView === 'month' && styles.dashboardTogglePillActive,
+                      ]}
+                      onPress={() => setDashboardView('month')}
+                    >
+                      <Text
+                        style={[
+                          styles.dashboardToggleText,
+                          dashboardView === 'month' && styles.dashboardToggleTextActive,
+                        ]}
+                      >
+                        Monthly
+                      </Text>
+                    </TouchableOpacity>
                   </View>
                 </View>
 
+                {/* Amount */}
                 <Text
                   style={[
                     styles.totalBalanceValue,
-                    { color: wallet.totalBalance >= 0 ? '#0F172A' : '#DC2626' },
+                    {
+                      color:
+                        (dashboardView === 'all' ? allTimeWallet.totalBalance : wallet.totalBalance) >= 0
+                          ? '#0F172A'
+                          : '#DC2626',
+                    },
                   ]}
                 >
-                  {formatINR(wallet.totalBalance)}
+                  {formatINR(dashboardView === 'all' ? allTimeWallet.totalBalance : wallet.totalBalance)}
                 </Text>
+
+                {/* Month Navigator if Monthly View is selected */}
+                {dashboardView === 'month' && (
+                  <View style={styles.homeMonthNavRow}>
+                    <TouchableOpacity style={styles.monthNavMiniBtn} onPress={handlePrevMonth}>
+                      <Ionicons name="chevron-back" size={14} color="#475569" />
+                      <Text style={styles.monthNavMiniText}>Prev</Text>
+                    </TouchableOpacity>
+
+                    <Text style={styles.homeMonthNavLabel}>{formatMonthDisplay(selectedMonth)}</Text>
+
+                    <TouchableOpacity style={styles.monthNavMiniBtn} onPress={handleNextMonth}>
+                      <Text style={styles.monthNavMiniText}>Next</Text>
+                      <Ionicons name="chevron-forward" size={14} color="#475569" />
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={styles.homeMonthPdfBadgeBtn}
+                      onPress={() => openPdfModal(selectedMonth)}
+                    >
+                      <Ionicons name="document-text-outline" size={13} color="#2563EB" />
+                      <Text style={styles.homeMonthPdfBadgeText}>PDF</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
 
                 <View style={styles.totalSummaryRow}>
                   <View style={styles.summaryMiniStat}>
-                    <Text style={styles.miniStatLabel}>Total Received</Text>
-                    <Text style={styles.miniStatIncome}>+{formatINR(wallet.totalIncome)}</Text>
+                    <Text style={styles.miniStatLabel}>
+                      {dashboardView === 'all' ? 'All-Time Income' : 'Received This Month'}
+                    </Text>
+                    <Text style={styles.miniStatIncome}>
+                      +{formatINR(dashboardView === 'all' ? allTimeWallet.totalIncome : wallet.totalIncome)}
+                    </Text>
                   </View>
                   <View style={styles.miniStatDivider} />
                   <View style={styles.summaryMiniStat}>
-                    <Text style={styles.miniStatLabel}>Total Spent</Text>
-                    <Text style={styles.miniStatExpense}>-{formatINR(wallet.totalExpense)}</Text>
+                    <Text style={styles.miniStatLabel}>
+                      {dashboardView === 'all' ? 'All-Time Expense' : 'Spent This Month'}
+                    </Text>
+                    <Text style={styles.miniStatExpense}>
+                      -{formatINR(dashboardView === 'all' ? allTimeWallet.totalExpense : wallet.totalExpense)}
+                    </Text>
                   </View>
                 </View>
               </View>
 
-              {/* SEPARATE WALLETS: CASH vs UPI (Requested Feature) */}
+              {/* SEPARATE WALLETS: CASH vs UPI (Real Cumulative Accounts) */}
               <View style={styles.sectionHeaderRow}>
                 <Text style={styles.sectionTitle}>My Wallets & Accounts</Text>
-                <Text style={styles.walletHint}>Tracked Separately</Text>
+                <Text style={styles.walletHint}>Real All-Time Balances</Text>
               </View>
 
               <View style={styles.walletsContainer}>
@@ -813,23 +1144,27 @@ export default function App() {
                   <Text
                     style={[
                       styles.walletBalanceNumber,
-                      { color: wallet.upiBalance >= 0 ? '#1E1B4B' : '#DC2626' },
+                      { color: allTimeWallet.upiBalance >= 0 ? '#1E1B4B' : '#DC2626' },
                     ]}
                   >
-                    {formatINR(wallet.upiBalance)}
+                    {formatINR(allTimeWallet.upiBalance)}
                   </Text>
 
                   <View style={styles.walletDetailRow}>
                     <View style={styles.walletDetailItem}>
-                      <Text style={styles.walletDetailLabel}>UPI Expense</Text>
+                      <Text style={styles.walletDetailLabel}>
+                        {dashboardView === 'all' ? 'UPI Spent (All)' : 'UPI Spent (Month)'}
+                      </Text>
                       <Text style={styles.walletDetailExpense}>
-                        -{formatINR(wallet.upiExpense)}
+                        -{formatINR(dashboardView === 'all' ? allTimeWallet.upiExpense : wallet.upiExpense)}
                       </Text>
                     </View>
                     <View style={styles.walletDetailItem}>
-                      <Text style={styles.walletDetailLabel}>UPI Received</Text>
+                      <Text style={styles.walletDetailLabel}>
+                        {dashboardView === 'all' ? 'UPI Received' : 'UPI In (Month)'}
+                      </Text>
                       <Text style={styles.walletDetailIncome}>
-                        +{formatINR(wallet.upiIncome)}
+                        +{formatINR(dashboardView === 'all' ? allTimeWallet.upiIncome : wallet.upiIncome)}
                       </Text>
                     </View>
                   </View>
@@ -860,23 +1195,27 @@ export default function App() {
                   <Text
                     style={[
                       styles.walletBalanceNumber,
-                      { color: wallet.cashBalance >= 0 ? '#064E3B' : '#DC2626' },
+                      { color: allTimeWallet.cashBalance >= 0 ? '#064E3B' : '#DC2626' },
                     ]}
                   >
-                    {formatINR(wallet.cashBalance)}
+                    {formatINR(allTimeWallet.cashBalance)}
                   </Text>
 
                   <View style={styles.walletDetailRow}>
                     <View style={styles.walletDetailItem}>
-                      <Text style={styles.walletDetailLabel}>Cash Expense</Text>
+                      <Text style={styles.walletDetailLabel}>
+                        {dashboardView === 'all' ? 'Cash Spent (All)' : 'Cash Spent (Month)'}
+                      </Text>
                       <Text style={styles.walletDetailExpense}>
-                        -{formatINR(wallet.cashExpense)}
+                        -{formatINR(dashboardView === 'all' ? allTimeWallet.cashExpense : wallet.cashExpense)}
                       </Text>
                     </View>
                     <View style={styles.walletDetailItem}>
-                      <Text style={styles.walletDetailLabel}>Cash Received</Text>
+                      <Text style={styles.walletDetailLabel}>
+                        {dashboardView === 'all' ? 'Cash Received' : 'Cash In (Month)'}
+                      </Text>
                       <Text style={styles.walletDetailIncome}>
-                        +{formatINR(wallet.cashIncome)}
+                        +{formatINR(dashboardView === 'all' ? allTimeWallet.cashIncome : wallet.cashIncome)}
                       </Text>
                     </View>
                   </View>
@@ -955,15 +1294,15 @@ export default function App() {
                 </TouchableOpacity>
               </View>
 
-              {/* Recent Transactions */}
+              {/* Recent Transactions (Latest 5 across all dates) */}
               <View style={styles.sectionHeaderRow}>
                 <Text style={styles.sectionTitle}>Recent Transactions</Text>
                 <TouchableOpacity onPress={() => setActiveTab('history')}>
-                  <Text style={styles.seeAllText}>View All ({transactions.length})</Text>
+                  <Text style={styles.seeAllText}>View All History</Text>
                 </TouchableOpacity>
               </View>
 
-              {transactions.length === 0 ? (
+              {recentTransactions.length === 0 ? (
                 <View style={styles.emptyContainer}>
                   <Ionicons name="wallet-outline" size={44} color="#94A3B8" />
                   <Text style={styles.emptyTitle}>No transactions recorded</Text>
@@ -972,7 +1311,7 @@ export default function App() {
                   </Text>
                 </View>
               ) : (
-                transactions.slice(0, 5).map((item) => (
+                recentTransactions.map((item) => (
                   <TouchableOpacity
                     key={item.id}
                     style={styles.transactionCard}
@@ -993,7 +1332,9 @@ export default function App() {
                     </View>
 
                     <View style={styles.transactionDetails}>
-                      <Text style={styles.transactionTitle}>{item.title}</Text>
+                      <Text style={styles.transactionTitle} numberOfLines={1} ellipsizeMode="tail">
+                        {item.title}
+                      </Text>
                       <View style={styles.txMetaRow}>
                         <View
                           style={[
@@ -1010,8 +1351,12 @@ export default function App() {
                             {item.paymentMethod.toUpperCase()}
                           </Text>
                         </View>
-                        <Text style={styles.transactionMeta}>
-                          {item.category} • {item.date}
+                        <Text
+                          style={styles.transactionMeta}
+                          numberOfLines={1}
+                          ellipsizeMode="tail"
+                        >
+                          {item.category} • {formatDateDisplay(item.date)}
                         </Text>
                       </View>
                     </View>
@@ -1022,6 +1367,7 @@ export default function App() {
                           styles.transactionAmount,
                           { color: item.type === 'income' ? '#16A34A' : '#DC2626' },
                         ]}
+                        numberOfLines={1}
                       >
                         {item.type === 'income' ? '+' : '-'}
                         {formatINR(item.amount)}
@@ -1054,6 +1400,14 @@ export default function App() {
 
                 <TouchableOpacity style={styles.monthArrowBtn} onPress={handleNextMonth}>
                   <Ionicons name="chevron-forward" size={18} color="#0F172A" />
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.analyticsPdfBtn}
+                  onPress={() => openPdfModal(selectedMonth)}
+                >
+                  <Ionicons name="document-text-outline" size={14} color="#2563EB" />
+                  <Text style={styles.analyticsPdfBtnText}>PDF</Text>
                 </TouchableOpacity>
               </View>
 
@@ -1329,54 +1683,103 @@ export default function App() {
                   ) : null}
                 </View>
 
-                {/* Filter Rows: Wallet Selector + Type Selector */}
-                <View style={styles.filterPillsRow}>
-                  {/* Wallet Filter (All / UPI / Cash) */}
-                  <View style={styles.walletFilterGroup}>
-                    {(['all', 'upi', 'cash'] as const).map((w) => (
-                      <TouchableOpacity
-                        key={w}
-                        style={[
-                          styles.walletFilterPill,
-                          historyWalletFilter === w && styles.activeWalletFilterPill,
-                        ]}
-                        onPress={() => setHistoryWalletFilter(w)}
-                      >
-                        <Text
-                          style={[
-                            styles.walletFilterPillText,
-                            historyWalletFilter === w && styles.activeWalletFilterPillText,
-                          ]}
-                        >
-                          {w === 'all' ? 'All Wallets' : w === 'upi' ? '📱 UPI' : '💵 Cash'}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
+              {/* Filter Rows: Wallet Selector + Type Selector */}
+              <View style={styles.filterPillsRow}>
+                {/* Period Filter (All Time / Selected Month) */}
+                <View style={styles.historyPeriodRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.historyPeriodPill,
+                      historyPeriodFilter === 'all' && styles.activeHistoryPeriodPill,
+                    ]}
+                    onPress={() => setHistoryPeriodFilter('all')}
+                  >
+                    <Ionicons
+                      name="infinite-outline"
+                      size={14}
+                      color={historyPeriodFilter === 'all' ? '#2563EB' : '#64748B'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.historyPeriodPillText,
+                        historyPeriodFilter === 'all' && styles.activeHistoryPeriodPillText,
+                      ]}
+                    >
+                      All Time (All Dates)
+                    </Text>
+                  </TouchableOpacity>
 
-                  {/* Type Filter (All / Expense / Income) */}
-                  <View style={styles.typeFilterGroup}>
-                    {(['all', 'expense', 'income'] as const).map((t) => (
-                      <TouchableOpacity
-                        key={t}
-                        style={[
-                          styles.typeFilterPill,
-                          historyTypeFilter === t && styles.activeTypeFilterPill,
-                        ]}
-                        onPress={() => setHistoryTypeFilter(t)}
-                      >
-                        <Text
-                          style={[
-                            styles.typeFilterPillText,
-                            historyTypeFilter === t && styles.activeTypeFilterPillText,
-                          ]}
-                        >
-                          {t.charAt(0).toUpperCase() + t.slice(1)}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
+                  <TouchableOpacity
+                    style={[
+                      styles.historyPeriodPill,
+                      historyPeriodFilter === 'month' && styles.activeHistoryPeriodPill,
+                    ]}
+                    onPress={() => setHistoryPeriodFilter('month')}
+                  >
+                    <Ionicons
+                      name="calendar-outline"
+                      size={14}
+                      color={historyPeriodFilter === 'month' ? '#2563EB' : '#64748B'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.historyPeriodPillText,
+                        historyPeriodFilter === 'month' && styles.activeHistoryPeriodPillText,
+                      ]}
+                    >
+                      {formatMonthDisplay(selectedMonth)}
+                    </Text>
+                  </TouchableOpacity>
                 </View>
+
+                {/* Wallet Filter (All / UPI / Cash) */}
+                <View style={styles.walletFilterGroup}>
+                  {(['all', 'upi', 'cash'] as const).map((w) => (
+                    <TouchableOpacity
+                      key={w}
+                      style={[
+                        styles.walletFilterPill,
+                        historyWalletFilter === w && styles.activeWalletFilterPill,
+                      ]}
+                      onPress={() => setHistoryWalletFilter(w)}
+                    >
+                      <Text
+                        style={[
+                          styles.walletFilterPillText,
+                          historyWalletFilter === w && styles.activeWalletFilterPillText,
+                        ]}
+                      >
+                        {w === 'all' ? 'All Wallets' : w === 'upi' ? '📱 UPI' : '💵 Cash'}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* Type Filter (All / Expense / Income) */}
+                <View style={styles.typeFilterGroup}>
+                  {(['all', 'expense', 'income'] as const).map((t) => (
+                    <TouchableOpacity
+                      key={t}
+                      style={[
+                        styles.typeFilterPill,
+                        historyTypeFilter === t && styles.activeTypeFilterPill,
+                      ]}
+                      onPress={() => setHistoryTypeFilter(t)}
+                    >
+                      <Text
+                        style={[
+                          styles.typeFilterPillText,
+                          historyTypeFilter === t && styles.activeTypeFilterPillText,
+                        ]}
+                      >
+                        {t.charAt(0).toUpperCase() + t.slice(1)}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </View>
               </View>
 
               {/* Transactions List */}
@@ -1385,13 +1788,23 @@ export default function App() {
                   <Text style={styles.sectionTitle}>
                     {transactions.length} Record{transactions.length === 1 ? '' : 's'}
                   </Text>
-                  <TouchableOpacity
-                    style={styles.csvExportBtn}
-                    onPress={() => exportToSpreadsheetCSV()}
-                  >
-                    <Ionicons name="document-text-outline" size={14} color="#2563EB" style={{ marginRight: 4 }} />
-                    <Text style={styles.csvExportBtnText}>Export Excel/CSV</Text>
-                  </TouchableOpacity>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <TouchableOpacity
+                      style={styles.pdfExportBtn}
+                      onPress={() => openPdfModal(selectedMonth)}
+                    >
+                      <Ionicons name="document-text-outline" size={14} color="#DC2626" style={{ marginRight: 4 }} />
+                      <Text style={styles.pdfExportBtnText}>PDF Statement</Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={styles.csvExportBtn}
+                      onPress={() => exportToSpreadsheetCSV()}
+                    >
+                      <Ionicons name="grid-outline" size={14} color="#2563EB" style={{ marginRight: 4 }} />
+                      <Text style={styles.csvExportBtnText}>Excel/CSV</Text>
+                    </TouchableOpacity>
+                  </View>
                 </View>
 
                 {transactions.length === 0 ? (
@@ -1422,7 +1835,9 @@ export default function App() {
                         </View>
 
                         <View style={styles.transactionDetails}>
-                          <Text style={styles.transactionTitle}>{item.title}</Text>
+                          <Text style={styles.transactionTitle} numberOfLines={1} ellipsizeMode="tail">
+                            {item.title}
+                          </Text>
                           <View style={styles.txMetaRow}>
                             <View
                               style={[
@@ -1439,12 +1854,16 @@ export default function App() {
                                 {item.paymentMethod.toUpperCase()}
                               </Text>
                             </View>
-                            <Text style={styles.transactionMeta}>
-                              {item.category} • {item.date}
+                            <Text
+                              style={styles.transactionMeta}
+                              numberOfLines={1}
+                              ellipsizeMode="tail"
+                            >
+                              {item.category} • {formatDateDisplay(item.date)}
                             </Text>
                           </View>
                           {item.notes ? (
-                            <Text style={styles.transactionNotes} numberOfLines={1}>
+                            <Text style={styles.transactionNotes} numberOfLines={1} ellipsizeMode="tail">
                               {item.notes}
                             </Text>
                           ) : null}
@@ -1457,6 +1876,7 @@ export default function App() {
                             styles.transactionAmount,
                             { color: item.type === 'income' ? '#16A34A' : '#DC2626' },
                           ]}
+                          numberOfLines={1}
                         >
                           {item.type === 'income' ? '+' : '-'}
                           {formatINR(item.amount)}
@@ -1526,21 +1946,202 @@ export default function App() {
                 </View>
               </View>
 
+              {/* Category Monthly Limits Section */}
+              <View style={styles.settingsSectionCard}>
+                <View style={styles.categoryLimitToggleRow}>
+                  <View style={{ flex: 1, marginRight: 12 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                      <Ionicons name="pricetags-outline" size={18} color="#2563EB" />
+                      <Text style={styles.settingLabel}>Category Monthly Limits</Text>
+                    </View>
+                    <Text style={styles.settingSubLabel}>
+                      Set monthly budgets for Food, Petrol, Service &amp; custom categories
+                    </Text>
+                  </View>
+
+                  {/* Switch Button */}
+                  <TouchableOpacity
+                    style={[
+                      styles.limitSwitchTrack,
+                      categoryLimitsEnabled && styles.limitSwitchTrackActive,
+                    ]}
+                    onPress={handleToggleCategoryLimits}
+                    activeOpacity={0.8}
+                  >
+                    <View
+                      style={[
+                        styles.limitSwitchThumb,
+                        categoryLimitsEnabled && styles.limitSwitchThumbActive,
+                      ]}
+                    />
+                  </TouchableOpacity>
+                </View>
+
+                {/* When ON: Show Category Limits Menu */}
+                {categoryLimitsEnabled && (
+                  <View style={styles.categoryLimitsMenuBox}>
+                    <View style={styles.catLimitsMenuHeader}>
+                      {/* Top Row: Title & Month on Left, Set Limit Button on Right */}
+                      <View style={styles.catLimitsTopRow}>
+                        <View style={styles.catLimitsTitleGroup}>
+                          <Text style={styles.catLimitsMenuTitle}>Category Budgets</Text>
+                          <View style={styles.monthBadgeMini}>
+                            <Text style={styles.monthBadgeMiniText}>
+                              {formatMonthDisplay(selectedMonth)}
+                            </Text>
+                          </View>
+                        </View>
+                        <TouchableOpacity
+                          style={styles.addCategoryLimitBtn}
+                          onPress={() => {
+                            setLimitCategoryName('');
+                            setLimitAmountInput('');
+                            setLimitModalVisible(true);
+                          }}
+                        >
+                          <Ionicons name="add-circle" size={14} color="#FFFFFF" />
+                          <Text style={styles.addCategoryLimitBtnText}>Set Limit</Text>
+                        </TouchableOpacity>
+                      </View>
+
+                      {/* Full-width Subtitle Description */}
+                      <Text style={styles.catLimitsMenuSub}>
+                        Limits reduce automatically as you spend in each category.
+                      </Text>
+                    </View>
+
+                    {/* Quick Presets if empty or available */}
+                    {categoryLimitStatuses.length === 0 && (
+                      <View style={styles.presetBox}>
+                        <Text style={styles.presetTitle}>Quick Setup Suggestions:</Text>
+                        <View style={styles.presetChipsRow}>
+                          <TouchableOpacity
+                            style={styles.presetChip}
+                            onPress={() => handleSaveCategoryLimit('Food', 2000)}
+                          >
+                            <Ionicons name="restaurant-outline" size={13} color="#F97316" />
+                            <Text style={styles.presetChipText}>+ Food (₹2,000)</Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            style={styles.presetChip}
+                            onPress={() => handleSaveCategoryLimit('Petrol', 1000)}
+                          >
+                            <Ionicons name="car-outline" size={13} color="#3B82F6" />
+                            <Text style={styles.presetChipText}>+ Petrol (₹1,000)</Text>
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            style={styles.presetChip}
+                            onPress={() => handleSaveCategoryLimit('Service', 2000)}
+                          >
+                            <Ionicons name="construct-outline" size={13} color="#8B5CF6" />
+                            <Text style={styles.presetChipText}>+ Service (₹2,000)</Text>
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+                    )}
+
+                    {/* List of Category Limits */}
+                    {categoryLimitStatuses.map((st) => (
+                      <View key={st.category} style={styles.catLimitCard}>
+                        <View style={styles.catLimitCardTop}>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                            <View
+                              style={[
+                                styles.catLimitIconWrap,
+                                { backgroundColor: (st.color || '#3B82F6') + '1A' },
+                              ]}
+                            >
+                              <Ionicons
+                                name={(st.icon as any) || 'pricetag'}
+                                size={18}
+                                color={st.color || '#3B82F6'}
+                              />
+                            </View>
+                            <View>
+                              <Text style={styles.catLimitCardName}>{st.category}</Text>
+                              <Text style={styles.catLimitCardSub}>
+                                Limit: {formatINR(st.limit)} &bull; Spent: {formatINR(st.spent)}
+                              </Text>
+                            </View>
+                          </View>
+
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                            <TouchableOpacity
+                              style={styles.catLimitActionBtn}
+                              onPress={() => {
+                                setLimitCategoryName(st.category);
+                                setLimitAmountInput(String(st.limit));
+                                setLimitModalVisible(true);
+                              }}
+                            >
+                              <Ionicons name="pencil-outline" size={15} color="#475569" />
+                            </TouchableOpacity>
+
+                            <TouchableOpacity
+                              style={styles.catLimitActionBtn}
+                              onPress={() => handleDeleteCategoryLimit(st.category)}
+                            >
+                              <Ionicons name="trash-outline" size={15} color="#DC2626" />
+                            </TouchableOpacity>
+                          </View>
+                        </View>
+
+                        {/* Progress Bar & Remaining */}
+                        <View style={styles.catLimitProgressRow}>
+                          <View style={[styles.progressBarBg, { flex: 1 }]}>
+                            <View
+                              style={[
+                                styles.progressBarFill,
+                                {
+                                  width: `${Math.min(st.percent, 100)}%`,
+                                  backgroundColor: st.isOverLimit
+                                    ? '#DC2626'
+                                    : st.percent > 80
+                                    ? '#F59E0B'
+                                    : '#10B981',
+                                },
+                              ]}
+                            />
+                          </View>
+                          <Text
+                            style={[
+                              styles.catLimitRemainingText,
+                              st.isOverLimit && { color: '#DC2626' },
+                            ]}
+                          >
+                            {st.isOverLimit
+                              ? `Over by ${formatINR(Math.abs(st.remaining))}`
+                              : `${formatINR(st.remaining)} left`}
+                          </Text>
+                        </View>
+                      </View>
+                    ))}
+                  </View>
+                )}
+              </View>
+
               {/* Data Portability Section */}
-              <Text style={[styles.sectionTitle, { marginTop: 18 }]}>Backup & Data Portability</Text>
+              <Text style={[styles.sectionTitle, { marginTop: 18 }]}>Monthly Reports &amp; Statements</Text>
               <Text style={styles.sectionSubtitle}>
-                100% offline storage. Share your backup files to keep your data safe.
+                Download official monthly statements or export data for accounting.
               </Text>
 
               <View style={styles.settingsSectionCard}>
-                {/* Export JSON */}
-                <TouchableOpacity style={styles.settingsActionRow} onPress={() => exportBackupToFile()}>
-                  <View style={[styles.settingsActionIconWrap, { backgroundColor: '#EEF2FF' }]}>
-                    <Ionicons name="cloud-upload-outline" size={20} color="#4F46E5" />
+                {/* Download Monthly PDF Statement */}
+                <TouchableOpacity
+                  style={styles.settingsActionRow}
+                  onPress={() => openPdfModal(selectedMonth)}
+                >
+                  <View style={[styles.settingsActionIconWrap, { backgroundColor: '#EFF6FF' }]}>
+                    <Ionicons name="document-text" size={20} color="#2563EB" />
                   </View>
                   <View style={{ flex: 1, marginLeft: 12 }}>
-                    <Text style={styles.settingsActionTitle}>Export Full JSON Backup</Text>
-                    <Text style={styles.settingsActionDesc}>Contains all Cash and UPI history</Text>
+                    <Text style={styles.settingsActionTitle}>Download Monthly PDF Statement</Text>
+                    <Text style={styles.settingsActionDesc}>
+                      Separate Income &amp; Expense tables + overall summary (Multi-page PDF)
+                    </Text>
                   </View>
                   <Ionicons name="chevron-forward" size={18} color="#94A3B8" />
                 </TouchableOpacity>
@@ -1654,7 +2255,7 @@ export default function App() {
               color={activeTab === 'settings' ? '#2563EB' : '#94A3B8'}
             />
             <Text style={[styles.tabLabel, activeTab === 'settings' && styles.activeTabLabel]}>
-              Settings
+              More
             </Text>
           </TouchableOpacity>
         </View>
@@ -1666,7 +2267,15 @@ export default function App() {
           transparent={true}
           onRequestClose={() => setModalVisible(false)}
         >
-          <View style={styles.modalOverlay}>
+          <KeyboardAvoidingView
+            style={styles.modalOverlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <TouchableOpacity
+              style={styles.modalBackdropDismiss}
+              activeOpacity={1}
+              onPress={() => Keyboard.dismiss()}
+            />
             <View style={styles.modalCard}>
               <View style={styles.modalHeader}>
                 <Text style={styles.modalTitle}>
@@ -1677,7 +2286,12 @@ export default function App() {
                 </TouchableOpacity>
               </View>
 
-              <ScrollView showsVerticalScrollIndicator={false}>
+              <ScrollView
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode="on-drag"
+                contentContainerStyle={styles.modalScrollContent}
+              >
                 {/* 1. Transaction Type (Expense vs Income) */}
                 <View style={styles.typeSelector}>
                   <TouchableOpacity
@@ -1787,6 +2401,20 @@ export default function App() {
                 >
                   {filteredCategories.map((cat) => {
                     const isSelected = selectedCategory?.name === cat.name;
+                    const catStatus =
+                      categoryLimitsEnabled && txType === 'expense'
+                        ? categoryLimitStatuses.find(
+                            (s) =>
+                              s.category.toLowerCase() === cat.name.toLowerCase() ||
+                              (s.category.toLowerCase() === 'food' && cat.name.toLowerCase().includes('food')) ||
+                              (cat.name.toLowerCase() === 'food' && s.category.toLowerCase().includes('food')) ||
+                              (s.category.toLowerCase() === 'petrol' && cat.name.toLowerCase().includes('petrol')) ||
+                              (cat.name.toLowerCase() === 'petrol' && s.category.toLowerCase().includes('petrol')) ||
+                              (s.category.toLowerCase() === 'service' && cat.name.toLowerCase().includes('service')) ||
+                              (cat.name.toLowerCase() === 'service' && s.category.toLowerCase().includes('service'))
+                          )
+                        : null;
+
                     return (
                       <TouchableOpacity
                         key={cat.id}
@@ -1804,18 +2432,107 @@ export default function App() {
                           size={16}
                           color={isSelected ? cat.color : '#64748B'}
                         />
-                        <Text
-                          style={[
-                            styles.categoryChipText,
-                            isSelected && { color: cat.color, fontWeight: '700' },
-                          ]}
-                        >
-                          {cat.name}
-                        </Text>
+                        <View style={{ alignItems: 'flex-start' }}>
+                          <Text
+                            style={[
+                              styles.categoryChipText,
+                              isSelected && { color: cat.color, fontWeight: '700' },
+                            ]}
+                          >
+                            {cat.name}
+                          </Text>
+                          {catStatus && (
+                            <Text
+                              style={[
+                                styles.categoryChipLimitBadge,
+                                catStatus.isOverLimit && { color: '#DC2626', backgroundColor: '#FEE2E2' },
+                              ]}
+                            >
+                              ₹{catStatus.remaining > 0 ? `${catStatus.remaining}` : '0'} left
+                            </Text>
+                          )}
+                        </View>
                       </TouchableOpacity>
                     );
                   })}
                 </ScrollView>
+
+                {/* Live Category Budget Info Banner */}
+                {categoryLimitsEnabled && txType === 'expense' && activeLimitStatus && (
+                  <View style={styles.catBudgetBanner}>
+                    <View style={styles.catBudgetTopRow}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Ionicons name="speedometer-outline" size={16} color="#2563EB" />
+                        <Text style={styles.catBudgetTitle}>
+                          {activeLimitStatus.category} Monthly Budget
+                        </Text>
+                      </View>
+                      <View
+                        style={[
+                          styles.catRemainingBadge,
+                          remainingAfterAmount < 0
+                            ? styles.catRemainingBadgeDanger
+                            : remainingAfterAmount < activeLimitStatus.limit * 0.2
+                            ? styles.catRemainingBadgeWarning
+                            : styles.catRemainingBadgeSuccess,
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.catRemainingBadgeText,
+                            remainingAfterAmount < 0
+                              ? styles.catRemainingBadgeTextDanger
+                              : remainingAfterAmount < activeLimitStatus.limit * 0.2
+                              ? styles.catRemainingBadgeTextWarning
+                              : styles.catRemainingBadgeTextSuccess,
+                          ]}
+                        >
+                          {remainingAfterAmount >= 0
+                            ? `${formatINR(remainingAfterAmount)} left`
+                            : `Over by ${formatINR(Math.abs(remainingAfterAmount))}`}
+                        </Text>
+                      </View>
+                    </View>
+
+                    <View style={styles.catBudgetDetailsRow}>
+                      <Text style={styles.catBudgetSubText}>
+                        Limit: <Text style={{ fontWeight: '700', color: '#0F172A' }}>{formatINR(activeLimitStatus.limit)}</Text>
+                      </Text>
+                      <Text style={styles.catBudgetSubText}>
+                        Spent so far: <Text style={{ fontWeight: '700', color: '#DC2626' }}>{formatINR(currentSpentAdjusted)}</Text>
+                      </Text>
+                      {enteredAmountNum > 0 && (
+                        <Text style={styles.catBudgetSubText}>
+                          This bill: <Text style={{ fontWeight: '700', color: '#2563EB' }}>-{formatINR(enteredAmountNum)}</Text>
+                        </Text>
+                      )}
+                    </View>
+
+                    {/* Progress Bar */}
+                    <View style={styles.progressBarBg}>
+                      <View
+                        style={[
+                          styles.progressBarFill,
+                          {
+                            width: `${Math.min(calculatedUsedPercent, 100)}%`,
+                            backgroundColor:
+                              remainingAfterAmount < 0
+                                ? '#DC2626'
+                                : calculatedUsedPercent > 80
+                                ? '#F59E0B'
+                                : '#10B981',
+                          },
+                        ]}
+                      />
+                    </View>
+
+                    {remainingAfterAmount < 0 && (
+                      <Text style={styles.catBudgetWarningText}>
+                        ⚠️ This expense will exceed your monthly limit for {activeLimitStatus.category} by {formatINR(Math.abs(remainingAfterAmount))}!
+                      </Text>
+                    )}
+                  </View>
+                )}
 
                 {/* 5.1 Custom Category Input (When 'Other' category is selected) */}
                 {selectedCategory &&
@@ -1840,22 +2557,142 @@ export default function App() {
                     </View>
                   )}
 
-                {/* 6. Date */}
-                <Text style={styles.inputLabel}>Date (YYYY-MM-DD)</Text>
+                {/* 6. Date Selection */}
+                <View style={styles.dateLabelRow}>
+                  <Text style={styles.inputLabel}>Transaction Date</Text>
+                  <TouchableOpacity
+                    style={styles.calendarPickerTrigger}
+                    onPress={() => {
+                      setCalendarMonth(normalizeDateString(txDate)?.slice(0, 7) || getLocalYearMonth());
+                      setCalendarModalVisible(true);
+                    }}
+                  >
+                    <Ionicons name="calendar" size={15} color="#4F46E5" />
+                    <Text style={styles.calendarPickerTriggerText}>Calendar</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* Quick Date Presets */}
+                <View style={styles.quickDateChipsRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.quickDateChip,
+                      txDate === getTodayDateString() && styles.quickDateChipActive,
+                    ]}
+                    onPress={() => setTxDate(getTodayDateString())}
+                  >
+                    <Ionicons
+                      name="today-outline"
+                      size={13}
+                      color={txDate === getTodayDateString() ? '#FFFFFF' : '#475569'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.quickDateChipText,
+                        txDate === getTodayDateString() && styles.quickDateChipTextActive,
+                      ]}
+                    >
+                      Today
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.quickDateChip,
+                      txDate === getYesterdayDateString() && styles.quickDateChipActive,
+                    ]}
+                    onPress={() => setTxDate(getYesterdayDateString())}
+                  >
+                    <Ionicons
+                      name="time-outline"
+                      size={13}
+                      color={txDate === getYesterdayDateString() ? '#FFFFFF' : '#475569'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.quickDateChipText,
+                        txDate === getYesterdayDateString() && styles.quickDateChipTextActive,
+                      ]}
+                    >
+                      Yesterday
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.quickDateChip,
+                      txDate === getDaysAgoDateString(2) && styles.quickDateChipActive,
+                    ]}
+                    onPress={() => setTxDate(getDaysAgoDateString(2))}
+                  >
+                    <Text
+                      style={[
+                        styles.quickDateChipText,
+                        txDate === getDaysAgoDateString(2) && styles.quickDateChipTextActive,
+                      ]}
+                    >
+                      2 Days Ago
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.quickDateChip,
+                      txDate === getDaysAgoDateString(7) && styles.quickDateChipActive,
+                    ]}
+                    onPress={() => setTxDate(getDaysAgoDateString(7))}
+                  >
+                    <Text
+                      style={[
+                        styles.quickDateChipText,
+                        txDate === getDaysAgoDateString(7) && styles.quickDateChipTextActive,
+                      ]}
+                    >
+                      1 Week Ago
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* Date Input with Live Preview */}
                 <View style={styles.dateRow}>
                   <TextInput
                     style={[styles.input, { flex: 1, marginBottom: 0 }]}
-                    placeholder="YYYY-MM-DD"
+                    placeholder="YYYY-MM-DD or DD-MM-YYYY"
                     placeholderTextColor="#94A3B8"
                     value={txDate}
                     onChangeText={setTxDate}
                   />
                   <TouchableOpacity
-                    style={styles.todayBtn}
-                    onPress={() => setTxDate(new Date().toISOString().split('T')[0])}
+                    style={styles.openCalendarBtn}
+                    onPress={() => {
+                      setCalendarMonth(normalizeDateString(txDate)?.slice(0, 7) || getLocalYearMonth());
+                      setCalendarModalVisible(true);
+                    }}
                   >
-                    <Text style={styles.todayBtnText}>Today</Text>
+                    <Ionicons name="calendar-outline" size={18} color="#4F46E5" />
                   </TouchableOpacity>
+                </View>
+
+                {/* Live Date Preview */}
+                <View style={styles.datePreviewBadge}>
+                  <Ionicons
+                    name={normalizeDateString(txDate) ? 'checkmark-circle' : 'alert-circle'}
+                    size={14}
+                    color={normalizeDateString(txDate) ? '#16A34A' : '#F59E0B'}
+                    style={{ marginRight: 6 }}
+                  />
+                  <Text
+                    style={[
+                      styles.datePreviewText,
+                      !normalizeDateString(txDate) && { color: '#B45309' },
+                    ]}
+                  >
+                    {normalizeDateString(txDate)
+                      ? formatDateDisplay(txDate)
+                      : 'Please type date as YYYY-MM-DD or DD-MM-YYYY'}
+                  </Text>
                 </View>
 
                 {/* 7. Notes */}
@@ -1877,6 +2714,62 @@ export default function App() {
                 </TouchableOpacity>
               </ScrollView>
             </View>
+          </KeyboardAvoidingView>
+        </Modal>
+
+        {/* Interactive Calendar Date Picker Modal */}
+        <Modal
+          visible={calendarModalVisible}
+          animationType="fade"
+          transparent={true}
+          onRequestClose={() => setCalendarModalVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.calendarModalCard}>
+              <View style={styles.calendarHeaderRow}>
+                <TouchableOpacity
+                  style={styles.calendarArrowBtn}
+                  onPress={() => setCalendarMonth(getShiftedMonth(calendarMonth, -1))}
+                >
+                  <Ionicons name="chevron-back" size={20} color="#1E293B" />
+                </TouchableOpacity>
+
+                <Text style={styles.calendarMonthTitle}>
+                  {formatMonthDisplay(calendarMonth)}
+                </Text>
+
+                <TouchableOpacity
+                  style={styles.calendarArrowBtn}
+                  onPress={() => setCalendarMonth(getShiftedMonth(calendarMonth, 1))}
+                >
+                  <Ionicons name="chevron-forward" size={20} color="#1E293B" />
+                </TouchableOpacity>
+              </View>
+
+              {/* Day of Week Header */}
+              <View style={styles.calendarDaysHeader}>
+                {['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].map((d) => (
+                  <Text key={d} style={styles.calendarDayHeaderCell}>
+                    {d}
+                  </Text>
+                ))}
+              </View>
+
+              {/* Calendar Grid */}
+              <View style={styles.calendarGrid}>
+                {renderCalendarDays(calendarMonth, txDate, (pickedDate) => {
+                  setTxDate(pickedDate);
+                  setCalendarModalVisible(false);
+                })}
+              </View>
+
+              <TouchableOpacity
+                style={styles.calendarCancelBtn}
+                onPress={() => setCalendarModalVisible(false)}
+              >
+                <Text style={styles.calendarCancelText}>Close</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </Modal>
 
@@ -1887,7 +2780,15 @@ export default function App() {
           transparent={true}
           onRequestClose={() => setRestoreModalVisible(false)}
         >
-          <View style={styles.modalOverlay}>
+          <KeyboardAvoidingView
+            style={styles.modalOverlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <TouchableOpacity
+              style={styles.modalBackdropDismiss}
+              activeOpacity={1}
+              onPress={() => Keyboard.dismiss()}
+            />
             <View style={[styles.modalCard, { height: '80%' }]}>
               <View style={styles.modalHeader}>
                 <Text style={styles.modalTitle}>Restore Backup Data</Text>
@@ -1916,7 +2817,284 @@ export default function App() {
                 <Text style={styles.saveButtonText}>Restore All Records</Text>
               </TouchableOpacity>
             </View>
-          </View>
+          </KeyboardAvoidingView>
+        </Modal>
+
+        {/* ==================== 5. MONTHLY PDF STATEMENT MODAL ==================== */}
+        <Modal
+          visible={pdfModalVisible}
+          animationType="slide"
+          transparent
+          onRequestClose={() => setPdfModalVisible(false)}
+        >
+          <KeyboardAvoidingView
+            style={styles.modalOverlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <TouchableOpacity
+              style={styles.modalBackdropDismiss}
+              activeOpacity={1}
+              onPress={() => setPdfModalVisible(false)}
+            />
+            <View style={[styles.modalCard, { maxHeight: '90%' }]}>
+              <View style={styles.modalHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <View style={[styles.settingsActionIconWrap, { backgroundColor: '#EFF6FF', width: 34, height: 34 }]}>
+                    <Ionicons name="document-text" size={18} color="#2563EB" />
+                  </View>
+                  <View>
+                    <Text style={styles.modalTitle}>Monthly Statement PDF</Text>
+                    <Text style={styles.settingSubLabel}>Download multi-page PDF report</Text>
+                  </View>
+                </View>
+                <TouchableOpacity onPress={() => setPdfModalVisible(false)}>
+                  <Ionicons name="close" size={24} color="#64748B" />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 16 }}>
+                {/* Month Selector */}
+                <View style={styles.pdfMonthSelectorCard}>
+                  <Text style={styles.pdfCardSectionLabel}>SELECT STATEMENT MONTH</Text>
+                  <View style={styles.pdfMonthPickerRow}>
+                    <TouchableOpacity
+                      style={styles.pdfMonthArrowBtn}
+                      onPress={() => setPdfExportMonth((m) => getShiftedMonth(m, -1))}
+                    >
+                      <Ionicons name="chevron-back" size={18} color="#0F172A" />
+                    </TouchableOpacity>
+
+                    <View style={{ alignItems: 'center' }}>
+                      <Text style={styles.pdfSelectedMonthText}>{formatMonthDisplay(pdfExportMonth)}</Text>
+                      {pdfExportMonth !== currentMonthStr && (
+                        <TouchableOpacity
+                          style={{ marginTop: 2 }}
+                          onPress={() => setPdfExportMonth(currentMonthStr)}
+                        >
+                          <Text style={{ fontSize: 11, color: '#2563EB', fontWeight: '700' }}>
+                            Reset to Current Month
+                          </Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+
+                    <TouchableOpacity
+                      style={styles.pdfMonthArrowBtn}
+                      onPress={() => setPdfExportMonth((m) => getShiftedMonth(m, 1))}
+                    >
+                      <Ionicons name="chevron-forward" size={18} color="#0F172A" />
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Live Month Stats Preview */}
+                {(() => {
+                  const previewSummary = getWalletSummary(pdfExportMonth);
+                  const previewTxs = getTransactions({ month: pdfExportMonth });
+                  const previewIncomeCount = previewTxs.filter((t) => t.type === 'income').length;
+                  const previewExpenseCount = previewTxs.filter((t) => t.type === 'expense').length;
+                  const netVal = previewSummary.totalIncome - previewSummary.totalExpense;
+
+                  return (
+                    <View style={styles.pdfPreviewCard}>
+                      <Text style={styles.pdfCardSectionLabel}>MONTH PREVIEW &amp; SNAPSHOT</Text>
+                      
+                      <View style={styles.pdfStatsGrid}>
+                        <View style={[styles.pdfStatItem, { borderLeftColor: '#10B981' }]}>
+                          <Text style={styles.pdfStatLabel}>Total Income</Text>
+                          <Text style={[styles.pdfStatVal, { color: '#059669' }]}>
+                            +{formatINR(previewSummary.totalIncome)}
+                          </Text>
+                          <Text style={styles.pdfStatSub}>
+                            {previewIncomeCount} income record{previewIncomeCount === 1 ? '' : 's'}
+                          </Text>
+                        </View>
+
+                        <View style={[styles.pdfStatItem, { borderLeftColor: '#EF4444' }]}>
+                          <Text style={styles.pdfStatLabel}>Total Expenses</Text>
+                          <Text style={[styles.pdfStatVal, { color: '#DC2626' }]}>
+                            -{formatINR(previewSummary.totalExpense)}
+                          </Text>
+                          <Text style={styles.pdfStatSub}>
+                            {previewExpenseCount} expense record{previewExpenseCount === 1 ? '' : 's'}
+                          </Text>
+                        </View>
+                      </View>
+
+                      <View style={styles.pdfNetRow}>
+                        <Text style={styles.pdfNetLabel}>Net Monthly Savings:</Text>
+                        <Text
+                          style={[
+                            styles.pdfNetVal,
+                            { color: netVal >= 0 ? '#059669' : '#DC2626' },
+                          ]}
+                        >
+                          {netVal >= 0 ? '+' : ''}{formatINR(netVal)}
+                        </Text>
+                      </View>
+                    </View>
+                  );
+                })()}
+
+                {/* Feature Highlights */}
+                <View style={styles.pdfFeaturesBox}>
+                  <Text style={styles.pdfFeaturesTitle}>Included in this PDF Statement:</Text>
+                  <View style={styles.pdfFeatureItem}>
+                    <Ionicons name="checkmark-circle" size={16} color="#16A34A" />
+                    <Text style={styles.pdfFeatureText}>
+                      Overall Financial Summary: KPI cards, Cash vs UPI net split &amp; category distribution
+                    </Text>
+                  </View>
+                  <View style={styles.pdfFeatureItem}>
+                    <Ionicons name="checkmark-circle" size={16} color="#16A34A" />
+                    <Text style={styles.pdfFeatureText}>
+                      Monthly Income Table: Separate section with date, category, UPI/cash mode, notes &amp; subtotals
+                    </Text>
+                  </View>
+                  <View style={styles.pdfFeatureItem}>
+                    <Ionicons name="checkmark-circle" size={16} color="#16A34A" />
+                    <Text style={styles.pdfFeatureText}>
+                      Monthly Expense Table: Separate section with automatic multi-page layout &amp; repeated headers
+                    </Text>
+                  </View>
+                  <View style={styles.pdfFeatureItem}>
+                    <Ionicons name="layers-outline" size={16} color="#2563EB" />
+                    <Text style={styles.pdfFeatureText}>
+                      Multi-Page Smart Pagination: Additional pages generated cleanly if expenses are numerous
+                    </Text>
+                  </View>
+                </View>
+
+                {/* Action Button */}
+                <TouchableOpacity
+                  style={[styles.pdfDownloadBtn, isGeneratingPdf && { opacity: 0.7 }]}
+                  disabled={isGeneratingPdf}
+                  onPress={() => handleDownloadMonthlyPdf(pdfExportMonth)}
+                >
+                  <Ionicons
+                    name={isGeneratingPdf ? 'hourglass-outline' : 'download-outline'}
+                    size={20}
+                    color="#FFFFFF"
+                    style={{ marginRight: 8 }}
+                  />
+                  <Text style={styles.pdfDownloadBtnText}>
+                    {isGeneratingPdf
+                      ? 'Generating Multi-Page PDF...'
+                      : `Download ${formatMonthDisplay(pdfExportMonth)} PDF`}
+                  </Text>
+                </TouchableOpacity>
+              </ScrollView>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
+
+        {/* ==================== 6. SET CATEGORY LIMIT MODAL ==================== */}
+        <Modal
+          visible={limitModalVisible}
+          animationType="slide"
+          transparent
+          onRequestClose={() => setLimitModalVisible(false)}
+        >
+          <KeyboardAvoidingView
+            style={styles.modalOverlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <TouchableOpacity
+              style={styles.modalBackdropDismiss}
+              activeOpacity={1}
+              onPress={() => setLimitModalVisible(false)}
+            />
+            <View style={styles.modalCard}>
+              <View style={styles.modalHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <View style={[styles.settingsActionIconWrap, { backgroundColor: '#EFF6FF', width: 34, height: 34 }]}>
+                    <Ionicons name="pricetags" size={18} color="#2563EB" />
+                  </View>
+                  <View>
+                    <Text style={styles.modalTitle}>Set Category Monthly Limit</Text>
+                    <Text style={styles.settingSubLabel}>Budget will auto-reduce with expenses</Text>
+                  </View>
+                </View>
+                <TouchableOpacity onPress={() => setLimitModalVisible(false)}>
+                  <Ionicons name="close" size={24} color="#64748B" />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 16 }}>
+                {/* Category Selection / Input */}
+                <Text style={styles.inputLabel}>Select or Type Category Name</Text>
+                
+                {/* Quick category chips to pick from */}
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 10 }}>
+                  {['Food', 'Petrol', 'Service', 'Kirana & Groceries', 'Shopping & Clothes', 'Chai & Snacks', 'Mobile, Electricity & Bills'].map((c) => (
+                    <TouchableOpacity
+                      key={c}
+                      style={[
+                        styles.categoryChip,
+                        limitCategoryName.toLowerCase() === c.toLowerCase() && {
+                          backgroundColor: '#EFF6FF',
+                          borderColor: '#2563EB',
+                        },
+                      ]}
+                      onPress={() => setLimitCategoryName(c)}
+                    >
+                      <Text
+                        style={[
+                          styles.categoryChipText,
+                          limitCategoryName.toLowerCase() === c.toLowerCase() && {
+                            color: '#2563EB',
+                            fontWeight: '700',
+                          },
+                        ]}
+                      >
+                        {c}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+
+                <TextInput
+                  style={styles.input}
+                  placeholder="e.g. Food, Petrol, Service, Groceries..."
+                  placeholderTextColor="#94A3B8"
+                  value={limitCategoryName}
+                  onChangeText={setLimitCategoryName}
+                />
+
+                {/* Monthly Limit Amount */}
+                <Text style={styles.inputLabel}>Monthly Limit Amount (₹)</Text>
+                <TextInput
+                  style={[styles.input, { fontSize: 20, fontWeight: '700', color: '#0F172A' }]}
+                  placeholder="e.g. 2000"
+                  placeholderTextColor="#94A3B8"
+                  keyboardType="numeric"
+                  value={limitAmountInput}
+                  onChangeText={setLimitAmountInput}
+                />
+
+                {/* Quick Amount Suggestion Buttons */}
+                <View style={{ flexDirection: 'row', gap: 8, marginBottom: 16 }}>
+                  {[500, 1000, 2000, 3000, 5000].map((val) => (
+                    <TouchableOpacity
+                      key={val}
+                      style={styles.quickAmountBtn}
+                      onPress={() => setLimitAmountInput(String(val))}
+                    >
+                      <Text style={styles.quickAmountBtnText}>₹{val}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* Save Button */}
+                <TouchableOpacity
+                  style={[styles.saveButton, { backgroundColor: '#2563EB' }]}
+                  onPress={() => handleSaveCategoryLimit()}
+                >
+                  <Text style={styles.saveButtonText}>Save Category Limit</Text>
+                </TouchableOpacity>
+              </ScrollView>
+            </View>
+          </KeyboardAvoidingView>
         </Modal>
       </View>
     </SafeAreaView>
@@ -1963,9 +3141,9 @@ const styles = StyleSheet.create({
   headerLogo: {
     width: 44,
     height: 44,
-    borderRadius: 22,
-    borderWidth: 1.5,
-    borderColor: '#0E4B3E',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#3B82F633',
   },
   appTitle: {
     fontSize: 22,
@@ -2011,12 +3189,12 @@ const styles = StyleSheet.create({
   scrollContent: {
     paddingHorizontal: 16,
     paddingTop: 16,
-    paddingBottom: 90,
+    paddingBottom: 110,
   },
   totalBalanceCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 20,
-    padding: 20,
+    padding: 18,
     borderWidth: 1,
     borderColor: '#E2E8F0',
     marginBottom: 16,
@@ -2030,12 +3208,15 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
   },
   totalBalanceLabel: {
     fontSize: 12,
     color: '#64748B',
     fontWeight: '700',
-    letterSpacing: 0.8,
+    letterSpacing: 0.6,
+    flexShrink: 1,
   },
   monthBadge: {
     flexDirection: 'row',
@@ -2306,6 +3487,7 @@ const styles = StyleSheet.create({
   },
   cardMainTouch: {
     flex: 1,
+    minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
   },
@@ -2316,9 +3498,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 10,
+    flexShrink: 0,
   },
   transactionDetails: {
     flex: 1,
+    minWidth: 0,
+    marginRight: 8,
   },
   transactionTitle: {
     fontSize: 14,
@@ -2329,12 +3514,14 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     marginTop: 3,
+    flexShrink: 1,
   },
   walletPillSmall: {
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 6,
     marginRight: 6,
+    flexShrink: 0,
   },
   upiPill: {
     backgroundColor: '#EEF2FF',
@@ -2355,6 +3542,7 @@ const styles = StyleSheet.create({
   transactionMeta: {
     fontSize: 11,
     color: '#64748B',
+    flexShrink: 1,
   },
   transactionNotes: {
     fontSize: 10,
@@ -2364,6 +3552,7 @@ const styles = StyleSheet.create({
   amountCol: {
     alignItems: 'flex-end',
     marginLeft: 8,
+    flexShrink: 0,
   },
   transactionAmount: {
     fontSize: 14,
@@ -2813,13 +4002,20 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(15, 23, 42, 0.45)',
     justifyContent: 'flex-end',
   },
+  modalBackdropDismiss: {
+    flex: 1,
+  },
   modalCard: {
     backgroundColor: '#FFFFFF',
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     padding: 20,
-    maxHeight: '90%',
-    paddingBottom: Platform.OS === 'ios' ? 40 : 20,
+    maxHeight: '92%',
+    paddingBottom: Platform.OS === 'ios' ? 30 : 16,
+    width: '100%',
+  },
+  modalScrollContent: {
+    paddingBottom: 160, // Extra space so all inputs (Date, Notes, Save button) can scroll comfortably above mobile keyboard
   },
   modalHeader: {
     flexDirection: 'row',
@@ -2931,23 +4127,87 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginLeft: 5,
   },
+  dateLabelRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  calendarPickerTrigger: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#EEF2FF',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  calendarPickerTriggerText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#4F46E5',
+  },
+  quickDateChipsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 8,
+  },
+  quickDateChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F1F5F9',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+  },
+  quickDateChipActive: {
+    backgroundColor: '#2563EB',
+    borderColor: '#1D4ED8',
+  },
+  quickDateChipText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#475569',
+  },
+  quickDateChipTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
   dateRow: {
     flexDirection: 'row',
     gap: 8,
     alignItems: 'center',
   },
-  todayBtn: {
-    backgroundColor: '#F1F5F9',
-    paddingHorizontal: 12,
+  openCalendarBtn: {
+    backgroundColor: '#EEF2FF',
+    paddingHorizontal: 14,
     paddingVertical: 9,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: '#CBD5E1',
+    borderColor: '#C7D2FE',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  todayBtnText: {
-    color: '#2563EB',
-    fontWeight: '700',
+  datePreviewBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  datePreviewText: {
     fontSize: 12,
+    color: '#16A34A',
+    fontWeight: '600',
   },
   saveButton: {
     backgroundColor: '#2563EB',
@@ -3369,5 +4629,628 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#94A3B8',
     marginTop: 4,
+  },
+
+  // Dashboard Period View Toggle
+  dashboardViewToggle: {
+    flexDirection: 'row',
+    backgroundColor: '#F1F5F9',
+    borderRadius: 16,
+    padding: 2,
+    flexShrink: 0,
+  },
+  dashboardTogglePill: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 14,
+  },
+  dashboardTogglePillActive: {
+    backgroundColor: '#2563EB',
+  },
+  dashboardToggleText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#64748B',
+  },
+  dashboardToggleTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
+  homeMonthNavRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    marginVertical: 4,
+  },
+  monthNavMiniBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F1F5F9',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  monthNavMiniText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#475569',
+  },
+  homeMonthNavLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#1E293B',
+  },
+
+  // History Period Filter
+  historyPeriodRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 8,
+    width: '100%',
+  },
+  historyPeriodPill: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+  },
+  activeHistoryPeriodPill: {
+    backgroundColor: '#EFF6FF',
+    borderColor: '#3B82F6',
+  },
+  historyPeriodPillText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#64748B',
+  },
+  activeHistoryPeriodPillText: {
+    color: '#2563EB',
+    fontWeight: '700',
+  },
+
+  // Calendar Modal Styles
+  calendarModalCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    marginHorizontal: 20,
+    marginVertical: 'auto',
+    padding: 18,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 8,
+  },
+  calendarHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  calendarArrowBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    backgroundColor: '#F1F5F9',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  calendarMonthTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  calendarDaysHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  calendarDayHeaderCell: {
+    width: 38,
+    textAlign: 'center',
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#94A3B8',
+  },
+  calendarGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'flex-start',
+  },
+  calendarDayCell: {
+    width: `${100 / 7}%`,
+    height: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: 2,
+  },
+  calendarDayCellActiveBtn: {
+    borderRadius: 19,
+  },
+  calendarDaySelected: {
+    backgroundColor: '#2563EB',
+  },
+  calendarDayToday: {
+    borderWidth: 1.5,
+    borderColor: '#2563EB',
+  },
+  calendarDayText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#1E293B',
+  },
+  calendarDaySelectedText: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+  },
+  calendarDayTodayText: {
+    color: '#2563EB',
+    fontWeight: '800',
+  },
+  calendarCancelBtn: {
+    marginTop: 14,
+    paddingVertical: 10,
+    backgroundColor: '#F1F5F9',
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  calendarCancelText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#475569',
+  },
+
+  // PDF Statement Styles
+  homeMonthPdfBadgeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EFF6FF',
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    gap: 4,
+  },
+  homeMonthPdfBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#2563EB',
+  },
+  analyticsPdfBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EFF6FF',
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    gap: 4,
+  },
+  analyticsPdfBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#2563EB',
+  },
+  pdfExportBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FECACA',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+  },
+  pdfExportBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#DC2626',
+  },
+  pdfMonthSelectorCard: {
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 14,
+  },
+  pdfCardSectionLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#64748B',
+    letterSpacing: 0.5,
+    marginBottom: 10,
+    textTransform: 'uppercase',
+  },
+  pdfMonthPickerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  pdfMonthArrowBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pdfSelectedMonthText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  pdfPreviewCard: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 12,
+    padding: 14,
+    marginBottom: 14,
+  },
+  pdfStatsGrid: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 10,
+  },
+  pdfStatItem: {
+    flex: 1,
+    backgroundColor: '#F8FAFC',
+    borderRadius: 8,
+    padding: 10,
+    borderLeftWidth: 3,
+  },
+  pdfStatLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#64748B',
+    textTransform: 'uppercase',
+  },
+  pdfStatVal: {
+    fontSize: 14,
+    fontWeight: '800',
+    marginVertical: 2,
+  },
+  pdfStatSub: {
+    fontSize: 10,
+    color: '#94A3B8',
+    fontWeight: '500',
+  },
+  pdfNetRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#F1F5F9',
+  },
+  pdfNetLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  pdfNetVal: {
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  pdfFeaturesBox: {
+    backgroundColor: '#F8FAFC',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    padding: 14,
+    marginBottom: 16,
+  },
+  pdfFeaturesTitle: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#334155',
+    marginBottom: 8,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  pdfFeatureItem: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+    marginBottom: 6,
+  },
+  pdfFeatureText: {
+    flex: 1,
+    fontSize: 11.5,
+    color: '#475569',
+    lineHeight: 16,
+  },
+  pdfDownloadBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#2563EB',
+    paddingVertical: 14,
+    borderRadius: 12,
+    shadowColor: '#2563EB',
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
+  },
+  pdfDownloadBtnText: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
+
+  // Category Limit Toggle & Menu Styles
+  categoryLimitToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  limitSwitchTrack: {
+    width: 48,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#E2E8F0',
+    padding: 2,
+    justifyContent: 'center',
+  },
+  limitSwitchTrackActive: {
+    backgroundColor: '#2563EB',
+  },
+  limitSwitchThumb: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#FFFFFF',
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 2,
+  },
+  limitSwitchThumbActive: {
+    alignSelf: 'flex-end',
+  },
+  categoryLimitsMenuBox: {
+    marginTop: 14,
+    paddingTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: '#F1F5F9',
+  },
+  catLimitsMenuHeader: {
+    marginBottom: 12,
+  },
+  catLimitsTopRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 8,
+  },
+  catLimitsTitleGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    flex: 1,
+  },
+  catLimitsMenuTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  monthBadgeMini: {
+    backgroundColor: '#F1F5F9',
+    paddingHorizontal: 7,
+    paddingVertical: 2.5,
+    borderRadius: 6,
+  },
+  monthBadgeMiniText: {
+    fontSize: 10.5,
+    fontWeight: '700',
+    color: '#475569',
+  },
+  catLimitsMenuSub: {
+    fontSize: 11,
+    color: '#64748B',
+    marginTop: 4,
+    lineHeight: 15,
+  },
+  addCategoryLimitBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    flexShrink: 0,
+  },
+  addCategoryLimitBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  presetBox: {
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 10,
+  },
+  presetTitle: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#475569',
+    marginBottom: 6,
+  },
+  presetChipsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  presetChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 6,
+  },
+  presetChipText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#1E293B',
+  },
+  catLimitCard: {
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+  },
+  catLimitCardTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  catLimitIconWrap: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  catLimitCardName: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+  catLimitCardSub: {
+    fontSize: 10.5,
+    color: '#64748B',
+    marginTop: 1,
+  },
+  catLimitActionBtn: {
+    padding: 6,
+    borderRadius: 6,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  catLimitProgressRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  catLimitRemainingText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#10B981',
+    minWidth: 85,
+    textAlign: 'right',
+  },
+
+  // Category Budget Live Card inside Add Modal
+  catBudgetBanner: {
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 8,
+    marginBottom: 6,
+  },
+  catBudgetTopRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  catBudgetTitle: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+  catRemainingBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 2.5,
+    borderRadius: 6,
+  },
+  catRemainingBadgeSuccess: {
+    backgroundColor: '#DCFCE7',
+  },
+  catRemainingBadgeWarning: {
+    backgroundColor: '#FEF3C7',
+  },
+  catRemainingBadgeDanger: {
+    backgroundColor: '#FEE2E2',
+  },
+  catRemainingBadgeText: {
+    fontSize: 10.5,
+    fontWeight: '800',
+  },
+  catRemainingBadgeTextSuccess: {
+    color: '#15803D',
+  },
+  catRemainingBadgeTextWarning: {
+    color: '#B45309',
+  },
+  catRemainingBadgeTextDanger: {
+    color: '#B91C1C',
+  },
+  catBudgetDetailsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  catBudgetSubText: {
+    fontSize: 10.5,
+    color: '#64748B',
+  },
+  catBudgetWarningText: {
+    fontSize: 10.5,
+    fontWeight: '700',
+    color: '#DC2626',
+    marginTop: 6,
+  },
+  categoryChipLimitBadge: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: '#2563EB',
+    backgroundColor: '#EFF6FF',
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    borderRadius: 4,
+    marginTop: 2,
+  },
+  quickAmountBtn: {
+    flex: 1,
+    backgroundColor: '#F1F5F9',
+    paddingVertical: 6,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  quickAmountBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#334155',
   },
 });
