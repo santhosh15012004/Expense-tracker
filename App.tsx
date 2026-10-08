@@ -9,12 +9,12 @@ import {
   TextInput,
   Alert,
   StatusBar,
-  SafeAreaView,
   Platform,
   Image,
   KeyboardAvoidingView,
   Keyboard,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { G, Path, Circle, Rect, Text as SvgText } from 'react-native-svg';
 import {
@@ -35,6 +35,15 @@ import {
   setCategoryLimit,
   deleteCategoryLimit,
   getAllCategoryLimitStatuses,
+  getAllProfiles,
+  getActiveProfile,
+  getActiveProfileId,
+  setActiveProfileId,
+  createProfile,
+  updateProfile,
+  deleteProfile,
+  getProfileStats,
+  DEFAULT_PROFILE,
 } from './src/database/db';
 import {
   Transaction,
@@ -47,6 +56,7 @@ import {
   CategoryLimitStatus,
   TransactionType,
   PaymentMethod,
+  Profile,
 } from './src/database/types';
 import { exportToSpreadsheetCSV, restoreBackup } from './src/utils/backup';
 import { downloadMonthlyPdf } from './src/utils/pdfReport';
@@ -432,6 +442,23 @@ function DailyHistogramComponent({ data }: { data: DailySpend[] }) {
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabType>('home');
 
+  // Multi-Profile State (Like Instagram Account Switcher)
+  const [profiles, setProfiles] = useState<Profile[]>([DEFAULT_PROFILE]);
+  const [activeProfile, setActiveProfile] = useState<Profile>(DEFAULT_PROFILE);
+  const [profileSwitcherVisible, setProfileSwitcherVisible] = useState(false);
+  const [addProfileModalVisible, setAddProfileModalVisible] = useState(false);
+  const [editingProfile, setEditingProfile] = useState<Profile | null>(null);
+  const [profileNameInput, setProfileNameInput] = useState('');
+  const [selectedProfileColor, setSelectedProfileColor] = useState('#2563EB');
+  const [selectedProfileIcon, setSelectedProfileIcon] = useState('person');
+  const [profileStats, setProfileStats] = useState<{
+    profile: Profile;
+    balance: number;
+    income: number;
+    expense: number;
+    txCount: number;
+  }[]>([]);
+
   // App Data State
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
@@ -513,14 +540,15 @@ export default function App() {
     const monthToUse = targetMonth || pdfExportMonth || selectedMonth;
     try {
       setIsGeneratingPdf(true);
-      const monthSummary = getWalletSummary(monthToUse);
-      const monthTransactions = getTransactions({ month: monthToUse });
+      const monthSummary = getWalletSummary(monthToUse, activeProfile.id);
+      const monthTransactions = getTransactions({ month: monthToUse, profileId: activeProfile.id });
       const incTxs = monthTransactions.filter((t) => t.type === 'income');
       const expTxs = monthTransactions.filter((t) => t.type === 'expense');
-      const catBreakdown = getCategoryBreakdown(monthToUse);
+      const catBreakdown = getCategoryBreakdown(monthToUse, activeProfile.id);
 
       const result = await downloadMonthlyPdf({
         month: monthToUse,
+        profileName: activeProfile.name,
         summary: monthSummary,
         incomeTransactions: incTxs,
         expenseTransactions: expTxs,
@@ -608,45 +636,143 @@ export default function App() {
     setSelectedSliceIndex(null);
   };
 
-  // Load all SQLite/local data
+  // Profile Action Handlers
+  const openProfileSwitcher = () => {
+    try {
+      const stats = getProfileStats();
+      setProfileStats(stats);
+    } catch {}
+    setProfileSwitcherVisible(true);
+  };
+
+  const handleSwitchProfile = (profileId: string) => {
+    setActiveProfileId(profileId);
+    const all = getAllProfiles();
+    const target = all.find((p) => p.id === profileId) || all[0] || DEFAULT_PROFILE;
+    setActiveProfile(target);
+    setProfileSwitcherVisible(false);
+  };
+
+  const openAddProfileModal = () => {
+    setEditingProfile(null);
+    setProfileNameInput('');
+    setSelectedProfileColor('#EC4899');
+    setSelectedProfileIcon('heart');
+    setProfileSwitcherVisible(false);
+    setAddProfileModalVisible(true);
+  };
+
+  const openEditProfileModal = (p: Profile) => {
+    setEditingProfile(p);
+    setProfileNameInput(p.name);
+    setSelectedProfileColor(p.color || '#2563EB');
+    setSelectedProfileIcon(p.icon || 'person');
+    setProfileSwitcherVisible(false);
+    setAddProfileModalVisible(true);
+  };
+
+  const handleSaveProfile = () => {
+    const trimmed = profileNameInput.trim();
+    if (!trimmed) {
+      Alert.alert('Profile Name Required', 'Please enter a name (e.g. Mother, Friend, Santhosh).');
+      return;
+    }
+
+    if (editingProfile) {
+      updateProfile(editingProfile.id, trimmed, selectedProfileColor, selectedProfileIcon);
+      const all = getAllProfiles();
+      const updated = all.find((p) => p.id === editingProfile.id) || editingProfile;
+      if (activeProfile.id === editingProfile.id) {
+        setActiveProfile(updated);
+      }
+      setProfiles(all);
+    } else {
+      const created = createProfile(trimmed, selectedProfileColor, selectedProfileIcon);
+      setActiveProfileId(created.id);
+      setActiveProfile(created);
+    }
+
+    setAddProfileModalVisible(false);
+    setProfileNameInput('');
+    setEditingProfile(null);
+  };
+
+  const handleDeleteProfile = (profileId: string, profileName: string) => {
+    Alert.alert(
+      'Delete Profile',
+      `Are you sure you want to delete "${profileName}" and all its records? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            const res = deleteProfile(profileId);
+            if (!res.success) {
+              Alert.alert('Cannot Delete', res.message);
+            } else {
+              const all = getAllProfiles();
+              setProfiles(all);
+              const cur = getActiveProfile();
+              setActiveProfile(cur);
+              try {
+                setProfileStats(getProfileStats());
+              } catch {}
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  // Load all SQLite/local data for active profile
   const loadAllData = useCallback(() => {
     try {
-      const appSettings = getAppSettings();
+      const allProfs = getAllProfiles();
+      setProfiles(allProfs);
+      const curProfile = getActiveProfile();
+      setActiveProfile(curProfile);
+      try {
+        setProfileStats(getProfileStats());
+      } catch {}
+
+      const appSettings = getAppSettings(curProfile.id);
       setSettings(appSettings);
       setBudgetInput(appSettings.monthlyBudget > 0 ? String(appSettings.monthlyBudget) : '');
       setCategoryLimitsEnabled(!!appSettings.categoryLimitsEnabled);
-      const catStatuses = getAllCategoryLimitStatuses(selectedMonth);
+      const catStatuses = getAllCategoryLimitStatuses(selectedMonth, curProfile.id);
       setCategoryLimitStatuses(catStatuses);
 
       const cats = getAllCategories();
       setCategories(cats);
 
-      // 1. All-time wallet summary (real cumulative balance of cash and UPI)
-      const allSumm = getWalletSummary();
+      // 1. All-time wallet summary for active profile
+      const allSumm = getWalletSummary(undefined, curProfile.id);
       setAllTimeWallet(allSumm);
 
-      // 2. Selected month wallet summary
-      const summ = getWalletSummary(selectedMonth);
+      // 2. Selected month wallet summary for active profile
+      const summ = getWalletSummary(selectedMonth, curProfile.id);
       setWallet(summ);
 
       // 3. Category breakdown
-      const breakdown = getCategoryBreakdown(selectedMonth);
+      const breakdown = getCategoryBreakdown(selectedMonth, curProfile.id);
       setCategoryBreakdown(breakdown);
 
       // 4. Daily histogram
-      const daily = getDailySpendForMonth(selectedMonth);
+      const daily = getDailySpendForMonth(selectedMonth, curProfile.id);
       setDailySpends(daily);
 
       // 5. 6-month trends
-      const trends = getMonthlyTrends(6);
+      const trends = getMonthlyTrends(6, curProfile.id);
       setMonthlyTrends(trends);
 
-      // 6. 5 most recent transactions across all dates (for Dashboard)
-      const recent = getTransactions({ limit: 5 });
+      // 6. 5 most recent transactions for active profile
+      const recent = getTransactions({ limit: 5, profileId: curProfile.id });
       setRecentTransactions(recent);
 
       // 7. Transactions list for History tab
       const txs = getTransactions({
+        profileId: curProfile.id,
         month: historyPeriodFilter === 'month' ? selectedMonth : undefined,
         type: historyTypeFilter === 'all' ? undefined : historyTypeFilter,
         paymentMethod: historyWalletFilter === 'all' ? undefined : historyWalletFilter,
@@ -656,12 +782,12 @@ export default function App() {
     } catch (e: any) {
       Alert.alert('Database Error', e?.message || 'Failed to load local data');
     }
-  }, [selectedMonth, historyPeriodFilter, historyTypeFilter, historyWalletFilter, historySearch]);
+  }, [selectedMonth, historyPeriodFilter, historyTypeFilter, historyWalletFilter, historySearch, activeProfile.id]);
 
   useEffect(() => {
     initDatabase();
     loadAllData();
-  }, [loadAllData]);
+  }, [loadAllData, activeProfile.id]);
 
   // Open Add Modal with pre-configured wallet & type
   const openAddModal = (type: TransactionType = 'expense', method: PaymentMethod = 'upi') => {
@@ -809,6 +935,7 @@ export default function App() {
           paymentMethod,
           date: normDate,
           notes: notes.trim(),
+          profileId: editingTransaction.profileId || activeProfile.id,
         });
       } else {
         addTransaction({
@@ -821,6 +948,7 @@ export default function App() {
           paymentMethod,
           date: normDate,
           notes: notes.trim(),
+          profileId: activeProfile.id,
         });
       }
 
@@ -856,28 +984,28 @@ export default function App() {
   // Save Budget
   const handleSaveBudget = () => {
     const val = parseFloat(budgetInput) || 0;
-    saveAppSetting('monthlyBudget', String(val));
+    saveAppSetting('monthlyBudget', String(val), activeProfile.id);
     setSettings((prev) => ({ ...prev, monthlyBudget: val }));
     Alert.alert(
       'Budget Saved',
-      val > 0 ? `Monthly budget set to ${formatINR(val)}` : 'Monthly budget removed.'
+      val > 0 ? `Monthly budget for ${activeProfile.name} set to ${formatINR(val)}` : `Monthly budget for ${activeProfile.name} removed.`
     );
   };
 
   // Reset All
   const handleResetData = () => {
     Alert.alert(
-      '⚠️ Clear All Transactions?',
-      'This will erase all Cash and UPI records stored on this phone. Are you sure?',
+      `⚠️ Clear Transactions for ${activeProfile.name}?`,
+      `This will erase only the records belonging to "${activeProfile.name}". Other profiles will NOT be deleted. Are you sure?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Erase Everything',
+          text: 'Clear Data',
           style: 'destructive',
           onPress: () => {
-            resetAllData();
+            resetAllData(activeProfile.id);
             loadAllData();
-            Alert.alert('Cleared', 'All records wiped from local database.');
+            Alert.alert('Cleared', `Records for ${activeProfile.name} have been reset.`);
           },
         },
       ]
@@ -983,10 +1111,20 @@ export default function App() {
             />
             <View>
               <Text style={styles.appTitle}>Expense Tracker</Text>
-              <View style={styles.badgeRow}>
-                <View style={styles.onlineDot} />
-                <Text style={styles.badgeText}>Local Mobile SQLite • 100% Offline</Text>
-              </View>
+              {/* Instagram-style profile switcher pill */}
+              <TouchableOpacity
+                style={styles.profileHeaderSwitcherPill}
+                onPress={openProfileSwitcher}
+                activeOpacity={0.7}
+              >
+                <View style={[styles.profileAvatarMini, { backgroundColor: activeProfile.color || '#2563EB' }]}>
+                  <Ionicons name={(activeProfile.icon || 'person') as any} size={10} color="#FFFFFF" />
+                </View>
+                <Text style={styles.profileHeaderSwitcherName} numberOfLines={1}>
+                  {activeProfile.name}
+                </Text>
+                <Ionicons name="chevron-down" size={12} color="#2563EB" />
+              </TouchableOpacity>
             </View>
           </View>
 
@@ -997,6 +1135,16 @@ export default function App() {
               accessibilityLabel="Download Monthly Statement PDF"
             >
               <Ionicons name="document-text-outline" size={20} color="#2563EB" />
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.headerProfileButton, { borderColor: activeProfile.color || '#2563EB' }]}
+              onPress={openProfileSwitcher}
+              accessibilityLabel="Switch Account Profile"
+            >
+              <View style={[styles.headerProfileInnerAvatar, { backgroundColor: activeProfile.color || '#2563EB' }]}>
+                <Ionicons name={(activeProfile.icon || 'person') as any} size={14} color="#FFFFFF" />
+              </View>
             </TouchableOpacity>
           </View>
         </View>
@@ -1908,7 +2056,95 @@ export default function App() {
           {activeTab === 'settings' && (
             <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
               <Text style={styles.sectionTitle}>App Preferences</Text>
-              <Text style={styles.sectionSubtitle}>Currency is set to Indian Rupee (₹ INR)</Text>
+              <Text style={styles.sectionSubtitle}>Separate money tracking &amp; preferences</Text>
+
+              {/* Profiles & Accounts Management Card */}
+              <View style={styles.settingsSectionCard}>
+                <View style={styles.profileSectionHeaderRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.settingLabel}>Profiles &amp; Accounts</Text>
+                    <Text style={styles.settingSubLabel}>
+                      Track personal, mother &amp; friends money separately like Instagram
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={styles.addProfileHeaderBtn}
+                    onPress={openAddProfileModal}
+                  >
+                    <Ionicons name="add" size={16} color="#FFFFFF" />
+                    <Text style={styles.addProfileHeaderBtnText}>Add Profile</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* Active Profile Highlight Card */}
+                <TouchableOpacity
+                  style={[styles.profileActiveCard, { borderColor: (activeProfile.color || '#2563EB') + '66' }]}
+                  onPress={openProfileSwitcher}
+                  activeOpacity={0.8}
+                >
+                  <View style={[styles.profileAvatarLarge, { backgroundColor: activeProfile.color || '#2563EB' }]}>
+                    <Ionicons name={(activeProfile.icon || 'person') as any} size={22} color="#FFFFFF" />
+                  </View>
+                  <View style={{ flex: 1, marginLeft: 12 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={styles.profileActiveName}>{activeProfile.name}</Text>
+                      <View style={styles.activeProfileBadge}>
+                        <Text style={styles.activeProfileBadgeText}>Active</Text>
+                      </View>
+                    </View>
+                    <Text style={styles.profileActiveSub}>
+                      Tap to switch • Net Balance: {formatINR(allTimeWallet.totalBalance)}
+                    </Text>
+                  </View>
+                  <Ionicons name="swap-horizontal" size={20} color="#2563EB" />
+                </TouchableOpacity>
+
+                {/* Profiles List */}
+                <View style={styles.profileListWrap}>
+                  {profiles.map((p) => {
+                    const isActive = p.id === activeProfile.id;
+                    return (
+                      <View key={p.id} style={[styles.profileRowItem, isActive && styles.profileRowItemActive]}>
+                        <TouchableOpacity
+                          style={styles.profileRowLeftTouch}
+                          onPress={() => handleSwitchProfile(p.id)}
+                        >
+                          <View style={[styles.profileAvatarMedium, { backgroundColor: p.color || '#2563EB' }]}>
+                            <Ionicons name={(p.icon || 'person') as any} size={16} color="#FFFFFF" />
+                          </View>
+                          <View style={{ marginLeft: 10, flex: 1 }}>
+                            <Text style={[styles.profileRowName, isActive && styles.profileRowNameActive]}>
+                              {p.name}
+                            </Text>
+                            <Text style={styles.profileRowStatus}>
+                              {isActive ? 'Currently Active' : 'Tap to switch'}
+                            </Text>
+                          </View>
+                        </TouchableOpacity>
+
+                        <View style={styles.profileRowActions}>
+                          <TouchableOpacity
+                            style={styles.profileRowActionBtn}
+                            onPress={() => openEditProfileModal(p)}
+                            accessibilityLabel={`Edit ${p.name}`}
+                          >
+                            <Ionicons name="pencil-outline" size={16} color="#64748B" />
+                          </TouchableOpacity>
+                          {profiles.length > 1 && (
+                            <TouchableOpacity
+                              style={styles.profileRowActionBtn}
+                              onPress={() => handleDeleteProfile(p.id, p.name)}
+                              accessibilityLabel={`Delete ${p.name}`}
+                            >
+                              <Ionicons name="trash-outline" size={16} color="#EF4444" />
+                            </TouchableOpacity>
+                          )}
+                        </View>
+                      </View>
+                    );
+                  })}
+                </View>
+              </View>
 
               {/* Locked Indian Rupee Badge */}
               <View style={styles.inrCard}>
@@ -2284,6 +2520,16 @@ export default function App() {
                 <TouchableOpacity onPress={() => setModalVisible(false)}>
                   <Ionicons name="close" size={24} color="#64748B" />
                 </TouchableOpacity>
+              </View>
+
+              {/* Profile Context Pill */}
+              <View style={styles.modalProfilePillWrap}>
+                <View style={[styles.profileAvatarMini, { backgroundColor: activeProfile.color || '#2563EB' }]}>
+                  <Ionicons name={(activeProfile.icon || 'person') as any} size={10} color="#FFFFFF" />
+                </View>
+                <Text style={styles.modalProfilePillText}>
+                  Recording for: <Text style={{ fontWeight: '700', color: activeProfile.color || '#2563EB' }}>{activeProfile.name}</Text>
+                </Text>
               </View>
 
               <ScrollView
@@ -3091,6 +3337,291 @@ export default function App() {
                   onPress={() => handleSaveCategoryLimit()}
                 >
                   <Text style={styles.saveButtonText}>Save Category Limit</Text>
+                </TouchableOpacity>
+              </ScrollView>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
+
+        {/* ==================== 1. INSTAGRAM-STYLE ACCOUNT SWITCHER BOTTOM SHEET ==================== */}
+        <Modal
+          visible={profileSwitcherVisible}
+          animationType="slide"
+          transparent={true}
+          onRequestClose={() => setProfileSwitcherVisible(false)}
+        >
+          <View style={styles.sheetOverlay}>
+            <TouchableOpacity
+              style={styles.sheetBackdropDismiss}
+              activeOpacity={1}
+              onPress={() => setProfileSwitcherVisible(false)}
+            />
+            <View style={styles.sheetContainer}>
+              {/* Instagram-style drag indicator handle */}
+              <View style={styles.sheetHandleBar} />
+
+              <View style={styles.sheetHeaderRow}>
+                <View>
+                  <Text style={styles.sheetTitle}>Switch Account</Text>
+                  <Text style={styles.sheetSubtitle}>
+                    Separate money for yourself, mother &amp; friends
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.sheetCloseBtn}
+                  onPress={() => setProfileSwitcherVisible(false)}
+                >
+                  <Ionicons name="close" size={22} color="#64748B" />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView
+                style={{ maxHeight: 380 }}
+                showsVerticalScrollIndicator={false}
+                contentContainerStyle={{ paddingBottom: 16 }}
+              >
+                {profiles.map((p) => {
+                  const isActive = p.id === activeProfile.id;
+                  const stat = profileStats.find((s) => s.profile.id === p.id);
+                  const pBalance = stat ? stat.balance : (isActive ? allTimeWallet.totalBalance : 0);
+                  const pCount = stat ? stat.txCount : (isActive ? allTimeWallet.transactionCount : 0);
+
+                  return (
+                    <TouchableOpacity
+                      key={p.id}
+                      style={[
+                        styles.instagramProfileItem,
+                        isActive && styles.instagramProfileItemActive,
+                      ]}
+                      onPress={() => handleSwitchProfile(p.id)}
+                      activeOpacity={0.7}
+                    >
+                      {/* Avatar with Story-like border when active */}
+                      <View
+                        style={[
+                          styles.instagramAvatarRing,
+                          { borderColor: isActive ? p.color || '#2563EB' : '#E2E8F0' },
+                        ]}
+                      >
+                        <View style={[styles.instagramAvatarInner, { backgroundColor: p.color || '#2563EB' }]}>
+                          <Ionicons name={(p.icon || 'person') as any} size={20} color="#FFFFFF" />
+                        </View>
+                      </View>
+
+                      {/* Profile Details */}
+                      <View style={{ flex: 1, marginLeft: 14 }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                          <Text style={[styles.instagramProfileName, isActive && { color: '#0F172A', fontWeight: '800' }]}>
+                            {p.name}
+                          </Text>
+                          {isActive && (
+                            <View style={styles.currentActiveBadge}>
+                              <Text style={styles.currentActiveBadgeText}>Active</Text>
+                            </View>
+                          )}
+                        </View>
+                        <Text style={styles.instagramProfileStats}>
+                          Net: <Text style={{ fontWeight: '700', color: pBalance >= 0 ? '#16A34A' : '#DC2626' }}>{formatINR(pBalance)}</Text> • {pCount} records
+                        </Text>
+                      </View>
+
+                      {/* Instagram-style Radio Checkmark */}
+                      <View style={styles.instagramRadioWrap}>
+                        {isActive ? (
+                          <View style={[styles.instagramRadioSelected, { backgroundColor: p.color || '#2563EB' }]}>
+                            <Ionicons name="checkmark" size={14} color="#FFFFFF" />
+                          </View>
+                        ) : (
+                          <View style={styles.instagramRadioUnselected} />
+                        )}
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+
+                {/* + Add Profile Button (Like Instagram '+ Add Account') */}
+                <TouchableOpacity
+                  style={styles.instagramAddAccountBtn}
+                  onPress={openAddProfileModal}
+                  activeOpacity={0.7}
+                >
+                  <View style={styles.instagramAddAccountIconWrap}>
+                    <Ionicons name="add" size={20} color="#2563EB" />
+                  </View>
+                  <View style={{ flex: 1, marginLeft: 14 }}>
+                    <Text style={styles.instagramAddAccountText}>Add Profile / Person</Text>
+                    <Text style={styles.instagramAddAccountSub}>
+                      e.g. Mother, Friend, Santhosh, Roommates
+                    </Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={18} color="#94A3B8" />
+                </TouchableOpacity>
+              </ScrollView>
+            </View>
+          </View>
+        </Modal>
+
+        {/* ==================== 2. CREATE / EDIT PROFILE MODAL ==================== */}
+        <Modal
+          visible={addProfileModalVisible}
+          animationType="fade"
+          transparent={true}
+          onRequestClose={() => setAddProfileModalVisible(false)}
+        >
+          <KeyboardAvoidingView
+            style={styles.modalOverlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <TouchableOpacity
+              style={styles.modalBackdropDismiss}
+              activeOpacity={1}
+              onPress={() => Keyboard.dismiss()}
+            />
+            <View style={styles.profileModalCard}>
+              <View style={styles.modalHeader}>
+                <View>
+                  <Text style={styles.modalTitle}>
+                    {editingProfile ? 'Edit Profile' : 'New Profile'}
+                  </Text>
+                  <Text style={styles.modalSubtitle}>
+                    Separate money for individual people
+                  </Text>
+                </View>
+                <TouchableOpacity onPress={() => setAddProfileModalVisible(false)}>
+                  <Ionicons name="close" size={24} color="#64748B" />
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+                {/* Live Preview Avatar */}
+                <View style={styles.profilePreviewWrap}>
+                  <View style={[styles.profilePreviewAvatar, { backgroundColor: selectedProfileColor }]}>
+                    <Ionicons name={selectedProfileIcon as any} size={36} color="#FFFFFF" />
+                  </View>
+                  <Text style={styles.profilePreviewName}>
+                    {profileNameInput.trim() || 'Profile Name'}
+                  </Text>
+                  <Text style={styles.profilePreviewSub}>
+                    Expenses &amp; Wallets will be isolated
+                  </Text>
+                </View>
+
+                {/* Profile Name Input */}
+                <Text style={styles.inputLabel}>Profile Name *</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="e.g. Mother, Friend, Karthik, Family"
+                  placeholderTextColor="#94A3B8"
+                  value={profileNameInput}
+                  onChangeText={setProfileNameInput}
+                  maxLength={30}
+                />
+
+                {/* Quick Name Presets */}
+                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 16 }}>
+                  {['My Money', 'Mother', 'Father', 'Friend', 'Roommates', 'Office'].map((preset) => (
+                    <TouchableOpacity
+                      key={preset}
+                      style={[
+                        styles.quickPresetPill,
+                        profileNameInput === preset && styles.quickPresetPillActive,
+                      ]}
+                      onPress={() => {
+                        setProfileNameInput(preset);
+                        if (preset === 'Mother') {
+                          setSelectedProfileColor('#EC4899');
+                          setSelectedProfileIcon('heart');
+                        } else if (preset === 'Friend' || preset === 'Roommates') {
+                          setSelectedProfileColor('#10B981');
+                          setSelectedProfileIcon('people');
+                        } else if (preset === 'Office') {
+                          setSelectedProfileColor('#8B5CF6');
+                          setSelectedProfileIcon('briefcase');
+                        }
+                      }}
+                    >
+                      <Text
+                        style={[
+                          styles.quickPresetText,
+                          profileNameInput === preset && styles.quickPresetTextActive,
+                        ]}
+                      >
+                        {preset}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* Color Selector */}
+                <Text style={styles.inputLabel}>Avatar Color</Text>
+                <View style={styles.colorPaletteRow}>
+                  {[
+                    '#2563EB', // Blue
+                    '#EC4899', // Pink (Mom)
+                    '#10B981', // Emerald (Friend)
+                    '#F59E0B', // Amber
+                    '#8B5CF6', // Purple
+                    '#06B6D4', // Cyan
+                    '#EF4444', // Red
+                    '#059669', // Teal
+                  ].map((c) => (
+                    <TouchableOpacity
+                      key={c}
+                      style={[
+                        styles.colorCircle,
+                        { backgroundColor: c },
+                        selectedProfileColor === c && styles.colorCircleSelected,
+                      ]}
+                      onPress={() => setSelectedProfileColor(c)}
+                    >
+                      {selectedProfileColor === c && (
+                        <Ionicons name="checkmark" size={14} color="#FFFFFF" />
+                      )}
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* Icon Selector */}
+                <Text style={styles.inputLabel}>Avatar Icon</Text>
+                <View style={styles.iconPaletteRow}>
+                  {[
+                    { id: 'person', label: 'Person' },
+                    { id: 'heart', label: 'Heart' },
+                    { id: 'people', label: 'Friends' },
+                    { id: 'home', label: 'Home' },
+                    { id: 'briefcase', label: 'Work' },
+                    { id: 'wallet', label: 'Savings' },
+                    { id: 'card', label: 'Card' },
+                    { id: 'school', label: 'Study' },
+                  ].map((ic) => (
+                    <TouchableOpacity
+                      key={ic.id}
+                      style={[
+                        styles.iconCircle,
+                        selectedProfileIcon === ic.id && {
+                          backgroundColor: selectedProfileColor + '20',
+                          borderColor: selectedProfileColor,
+                        },
+                      ]}
+                      onPress={() => setSelectedProfileIcon(ic.id)}
+                    >
+                      <Ionicons
+                        name={ic.id as any}
+                        size={20}
+                        color={selectedProfileIcon === ic.id ? selectedProfileColor : '#64748B'}
+                      />
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* Save Button */}
+                <TouchableOpacity
+                  style={[styles.saveButton, { backgroundColor: selectedProfileColor, marginTop: 12 }]}
+                  onPress={handleSaveProfile}
+                >
+                  <Text style={styles.saveButtonText}>
+                    {editingProfile ? 'Save Changes' : 'Create & Switch to Profile'}
+                  </Text>
                 </TouchableOpacity>
               </ScrollView>
             </View>
@@ -4027,6 +4558,11 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '800',
     color: '#0F172A',
+  },
+  modalSubtitle: {
+    fontSize: 11.5,
+    color: '#64748B',
+    marginTop: 2,
   },
   typeSelector: {
     flexDirection: 'row',
@@ -5252,5 +5788,428 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '700',
     color: '#334155',
+  },
+
+  // ==================== PROFILE SWITCHER & ACCOUNTS STYLES ====================
+  profileHeaderSwitcherPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    paddingHorizontal: 8,
+    paddingVertical: 3.5,
+    borderRadius: 14,
+    marginTop: 3,
+    alignSelf: 'flex-start',
+    gap: 5,
+  },
+  profileHeaderSwitcherName: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#1E293B',
+    maxWidth: 120,
+  },
+  profileAvatarMini: {
+    width: 17,
+    height: 17,
+    borderRadius: 9,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerProfileButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    borderWidth: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+    padding: 2,
+  },
+  headerProfileInnerAvatar: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalProfilePillWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F1F5F9',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    marginHorizontal: 18,
+    marginBottom: 10,
+    gap: 6,
+  },
+  modalProfilePillText: {
+    fontSize: 11.5,
+    color: '#475569',
+  },
+
+  // Bottom Sheet Switcher (Instagram Style)
+  sheetOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.55)',
+    justifyContent: 'flex-end',
+  },
+  sheetBackdropDismiss: {
+    flex: 1,
+  },
+  sheetContainer: {
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 20,
+    paddingTop: 12,
+    paddingBottom: Platform.OS === 'ios' ? 34 : 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -6 },
+    shadowOpacity: 0.12,
+    shadowRadius: 16,
+    elevation: 20,
+  },
+  sheetHandleBar: {
+    width: 40,
+    height: 4.5,
+    borderRadius: 3,
+    backgroundColor: '#CBD5E1',
+    alignSelf: 'center',
+    marginBottom: 14,
+  },
+  sheetHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 16,
+  },
+  sheetTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  sheetSubtitle: {
+    fontSize: 12,
+    color: '#64748B',
+    marginTop: 2,
+  },
+  sheetCloseBtn: {
+    padding: 4,
+    borderRadius: 16,
+    backgroundColor: '#F1F5F9',
+  },
+
+  // Instagram Profile Item in Sheet
+  instagramProfileItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    marginBottom: 6,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  instagramProfileItemActive: {
+    backgroundColor: '#F8FAFC',
+    borderColor: '#E2E8F0',
+  },
+  instagramAvatarRing: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    borderWidth: 2.5,
+    padding: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  instagramAvatarInner: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  instagramProfileName: {
+    fontSize: 14.5,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  instagramProfileStats: {
+    fontSize: 11.5,
+    color: '#64748B',
+    marginTop: 2,
+  },
+  currentActiveBadge: {
+    backgroundColor: '#EFF6FF',
+    paddingHorizontal: 6,
+    paddingVertical: 1.5,
+    borderRadius: 6,
+  },
+  currentActiveBadgeText: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    color: '#2563EB',
+  },
+  instagramRadioWrap: {
+    marginLeft: 8,
+  },
+  instagramRadioSelected: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  instagramRadioUnselected: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: '#CBD5E1',
+  },
+  instagramAddAccountBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    marginTop: 8,
+    borderWidth: 1.5,
+    borderColor: '#E2E8F0',
+    borderStyle: 'dashed',
+    backgroundColor: '#FAFAFA',
+  },
+  instagramAddAccountIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    borderWidth: 1.5,
+    borderColor: '#BFDBFE',
+    backgroundColor: '#EFF6FF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  instagramAddAccountText: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    color: '#2563EB',
+  },
+  instagramAddAccountSub: {
+    fontSize: 10.5,
+    color: '#64748B',
+    marginTop: 1,
+  },
+
+  // Profile Modal (Create / Edit)
+  profileModalCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    padding: 20,
+    width: '92%',
+    maxWidth: 420,
+    maxHeight: '85%',
+  },
+  profilePreviewWrap: {
+    alignItems: 'center',
+    paddingVertical: 14,
+    marginBottom: 14,
+    backgroundColor: '#F8FAFC',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  profilePreviewAvatar: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  profilePreviewName: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  profilePreviewSub: {
+    fontSize: 11,
+    color: '#64748B',
+    marginTop: 2,
+  },
+  quickPresetPill: {
+    backgroundColor: '#F1F5F9',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  quickPresetPillActive: {
+    backgroundColor: '#EFF6FF',
+    borderColor: '#3B82F6',
+  },
+  quickPresetText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#475569',
+  },
+  quickPresetTextActive: {
+    color: '#2563EB',
+    fontWeight: '700',
+  },
+  colorPaletteRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 16,
+  },
+  colorCircle: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  colorCircleSelected: {
+    borderWidth: 3,
+    borderColor: '#0F172A',
+  },
+  iconPaletteRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 16,
+  },
+  iconCircle: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  // Settings Screen Profiles Management Section
+  profileSectionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  addProfileHeaderBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    gap: 4,
+  },
+  addProfileHeaderBtnText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  profileActiveCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1.5,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+  },
+  profileAvatarLarge: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileActiveName: {
+    fontSize: 14.5,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  profileActiveSub: {
+    fontSize: 11,
+    color: '#64748B',
+    marginTop: 2,
+  },
+  activeProfileBadge: {
+    backgroundColor: '#DCFCE7',
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: 4,
+  },
+  activeProfileBadgeText: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    color: '#15803D',
+  },
+  profileListWrap: {
+    gap: 6,
+  },
+  profileRowItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  profileRowItemActive: {
+    borderColor: '#BFDBFE',
+    backgroundColor: '#F8FAFC',
+  },
+  profileRowLeftTouch: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+  },
+  profileAvatarMedium: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileRowName: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  profileRowNameActive: {
+    color: '#2563EB',
+  },
+  profileRowStatus: {
+    fontSize: 10,
+    color: '#64748B',
+    marginTop: 1,
+  },
+  profileRowActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  profileRowActionBtn: {
+    padding: 6,
+    borderRadius: 6,
+    backgroundColor: '#F1F5F9',
   },
 });

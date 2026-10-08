@@ -30,6 +30,7 @@ export interface MonthlyPdfData {
   incomeTransactions: Transaction[];
   expenseTransactions: Transaction[];
   categoryBreakdown: CategorySpend[];
+  profileName?: string;
   generatedAt?: Date;
 }
 
@@ -44,6 +45,7 @@ export function generateMonthlyStatementHtml(data: MonthlyPdfData): string {
     incomeTransactions,
     expenseTransactions,
     categoryBreakdown,
+    profileName,
     generatedAt = new Date(),
   } = data;
 
@@ -576,7 +578,7 @@ export function generateMonthlyStatementHtml(data: MonthlyPdfData): string {
     <div class="header-card avoid-break">
       <div class="header-title-wrap">
         <h1>Monthly Financial Statement</h1>
-        <div class="subtitle">Complete Income, Expense &amp; Cash Flow Overview</div>
+        <div class="subtitle">Complete Income, Expense &amp; Cash Flow Overview${profileName ? ` &bull; <strong>Profile: ${escapeHtml(profileName)}</strong>` : ''}</div>
       </div>
       <div class="header-meta">
         <div class="month-badge">${escapeHtml(monthDisplay)}</div>

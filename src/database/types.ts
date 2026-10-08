@@ -1,8 +1,17 @@
 export type TransactionType = 'expense' | 'income';
 export type PaymentMethod = 'cash' | 'upi';
 
+export interface Profile {
+  id: string;
+  name: string;
+  color: string;
+  icon: string;
+  createdAt: string;
+}
+
 export interface Transaction {
   id: number;
+  profileId?: string;
   title: string;
   amount: number;
   type: TransactionType;
@@ -65,6 +74,7 @@ export interface AppSettings {
   currency: string; // strictly '₹'
   monthlyBudget: number; // 0 means not set
   categoryLimitsEnabled?: boolean;
+  activeProfileId?: string;
 }
 
 export interface CategoryLimitStatus {

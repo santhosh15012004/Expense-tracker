@@ -11,6 +11,7 @@ import {
   CategoryLimitStatus,
   TransactionType,
   PaymentMethod,
+  Profile,
 } from './types';
 import {
   normalizeDateString,
@@ -21,6 +22,14 @@ import {
 
 let dbInstance: SQLite.SQLiteDatabase | null = null;
 const IS_WEB = Platform.OS === 'web';
+
+export const DEFAULT_PROFILE: Profile = {
+  id: 'profile_default',
+  name: 'My Money',
+  color: '#2563EB',
+  icon: 'person',
+  createdAt: '2026-01-01T00:00:00.000Z',
+};
 
 export const DEFAULT_CATEGORIES: Category[] = [
   // Expenses
@@ -65,10 +74,118 @@ function setWebStorage<T>(key: string, value: T): void {
   }
 }
 
+function ensureTransactionsSchema(db: SQLite.SQLiteDatabase): void {
+  try {
+    // 1. Check if profileId column exists by attempting to select it
+    let hasColumn = false;
+    try {
+      db.getFirstSync('SELECT profileId FROM transactions LIMIT 1;');
+      hasColumn = true;
+    } catch {
+      hasColumn = false;
+    }
+
+    if (hasColumn) {
+      // Column exists: ensure existing records have a valid profileId
+      try {
+        db.execSync("UPDATE transactions SET profileId = 'profile_default' WHERE profileId IS NULL OR profileId = '';");
+      } catch {}
+      return;
+    }
+
+    // 2. Check if the transactions table exists at all
+    let tableExists = false;
+    try {
+      db.getFirstSync('SELECT id FROM transactions LIMIT 1;');
+      tableExists = true;
+    } catch {
+      tableExists = false;
+    }
+
+    if (!tableExists) {
+      // Table will be created by initDatabase with profileId
+      return;
+    }
+
+    // 3. Transactions table exists, but lacks profileId. Try ALTER TABLE first.
+    let alterSucceeded = false;
+    try {
+      db.execSync('ALTER TABLE transactions ADD COLUMN profileId TEXT;');
+      alterSucceeded = true;
+    } catch {
+      try {
+        db.runSync('ALTER TABLE transactions ADD COLUMN profileId TEXT;');
+        alterSucceeded = true;
+      } catch {}
+    }
+
+    // 4. Verify whether ALTER TABLE succeeded
+    if (alterSucceeded) {
+      try {
+        db.getFirstSync('SELECT profileId FROM transactions LIMIT 1;');
+      } catch {
+        alterSucceeded = false;
+      }
+    }
+
+    // 5. If ALTER TABLE failed on Android, use table recreation migration to preserve all data
+    if (!alterSucceeded) {
+      try {
+        db.execSync(`
+          CREATE TABLE IF NOT EXISTS transactions_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profileId TEXT,
+            title TEXT NOT NULL,
+            amount REAL NOT NULL,
+            type TEXT NOT NULL,
+            category TEXT NOT NULL,
+            categoryIcon TEXT,
+            categoryColor TEXT,
+            paymentMethod TEXT NOT NULL DEFAULT 'upi',
+            date TEXT NOT NULL,
+            notes TEXT,
+            createdAt TEXT NOT NULL
+          );
+
+          INSERT INTO transactions_new (id, profileId, title, amount, type, category, categoryIcon, categoryColor, paymentMethod, date, notes, createdAt)
+          SELECT 
+            id, 
+            'profile_default', 
+            title, 
+            amount, 
+            type, 
+            category, 
+            COALESCE(categoryIcon, 'pricetag'), 
+            COALESCE(categoryColor, '#64748B'), 
+            COALESCE(paymentMethod, 'upi'), 
+            date, 
+            COALESCE(notes, ''), 
+            createdAt
+          FROM transactions;
+
+          DROP TABLE transactions;
+
+          ALTER TABLE transactions_new RENAME TO transactions;
+        `);
+      } catch (migrationErr) {
+        console.error('Failed table recreation migration:', migrationErr);
+      }
+    } else {
+      // Set default profileId for existing rows
+      try {
+        db.execSync("UPDATE transactions SET profileId = 'profile_default' WHERE profileId IS NULL OR profileId = '';");
+      } catch {}
+    }
+  } catch (err) {
+    console.error('Error in ensureTransactionsSchema:', err);
+  }
+}
+
 export function getDatabase(): SQLite.SQLiteDatabase | null {
   if (IS_WEB) return null;
   if (!dbInstance) {
     dbInstance = SQLite.openDatabaseSync('expenses.db');
+    ensureTransactionsSchema(dbInstance);
   }
   return dbInstance;
 }
@@ -79,18 +196,45 @@ export function initDatabase(): void {
     if (cats.length === 0) {
       setWebStorage('exp_categories', DEFAULT_CATEGORIES);
     }
+    const profiles = getWebStorage<Profile[]>('exp_profiles', []);
+    if (profiles.length === 0) {
+      setWebStorage('exp_profiles', [DEFAULT_PROFILE]);
+    }
     const settings = getWebStorage<Record<string, string>>('exp_settings', {});
     settings.currency = '₹';
     if (!settings.monthlyBudget) settings.monthlyBudget = '0';
+    if (!settings.activeProfileId) settings.activeProfileId = DEFAULT_PROFILE.id;
     setWebStorage('exp_settings', settings);
+
+    // Ensure all web transactions have profileId
+    const txs = getWebStorage<Transaction[]>('exp_transactions', []);
+    let updatedTxs = false;
+    for (const t of txs) {
+      if (!t.profileId) {
+        t.profileId = DEFAULT_PROFILE.id;
+        updatedTxs = true;
+      }
+    }
+    if (updatedTxs) {
+      setWebStorage('exp_transactions', txs);
+    }
     return;
   }
 
   const db = getDatabase()!;
 
   db.execSync(`
+    CREATE TABLE IF NOT EXISTS profiles (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      color TEXT NOT NULL,
+      icon TEXT NOT NULL,
+      createdAt TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      profileId TEXT,
       title TEXT NOT NULL,
       amount REAL NOT NULL,
       type TEXT NOT NULL,
@@ -117,11 +261,35 @@ export function initDatabase(): void {
     );
   `);
 
+  // Ensure profileId column in transactions table (for existing installations)
+  ensureTransactionsSchema(db);
+
+  // Ensure default profile in profiles table
+  const profileRow = db.getFirstSync<{ count: number }>('SELECT count(*) as count FROM profiles;');
+  if (!profileRow || profileRow.count === 0) {
+    db.runSync(
+      'INSERT INTO profiles (id, name, color, icon, createdAt) VALUES (?, ?, ?, ?, ?);',
+      [DEFAULT_PROFILE.id, DEFAULT_PROFILE.name, DEFAULT_PROFILE.color, DEFAULT_PROFILE.icon, DEFAULT_PROFILE.createdAt]
+    );
+  }
+
+  // Assign any orphaned transactions to default profile
+  try {
+    db.runSync("UPDATE transactions SET profileId = 'profile_default' WHERE profileId IS NULL OR profileId = '';");
+  } catch {
+    // ignore if table doesn't have rows or already updated
+  }
+
   // Ensure settings
   db.runSync("INSERT OR REPLACE INTO settings (key, value) VALUES ('currency', '₹');");
   const budget = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'monthlyBudget';");
   if (!budget) {
     db.runSync("INSERT INTO settings (key, value) VALUES ('monthlyBudget', '0');");
+  }
+
+  const activeProfileRow = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'activeProfileId';");
+  if (!activeProfileRow) {
+    db.runSync("INSERT INTO settings (key, value) VALUES ('activeProfileId', 'profile_default');");
   }
 
   // Seed default categories
@@ -185,32 +353,39 @@ export function sanitizeAllTransactionDates(): void {
   }
 }
 
-// ----------------- Settings -----------------
-export function getAppSettings(): AppSettings {
+// ----------------- Profile Management -----------------
+export function getAllProfiles(): Profile[] {
   if (IS_WEB) {
-    const s = getWebStorage<Record<string, string>>('exp_settings', {});
-    return {
-      currency: '₹',
-      monthlyBudget: s.monthlyBudget ? parseFloat(s.monthlyBudget) || 0 : 0,
-      categoryLimitsEnabled: s.categoryLimitsEnabled === 'true',
-    };
+    const list = getWebStorage<Profile[]>('exp_profiles', [DEFAULT_PROFILE]);
+    return list.length > 0 ? list : [DEFAULT_PROFILE];
   }
 
   const db = getDatabase()!;
-  const budgetRow = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'monthlyBudget';");
-  const limitsRow = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'categoryLimitsEnabled';");
-
-  return {
-    currency: '₹',
-    monthlyBudget: budgetRow ? parseFloat(budgetRow.value) || 0 : 0,
-    categoryLimitsEnabled: limitsRow?.value === 'true',
-  };
+  const rows = db.getAllSync<Profile>('SELECT * FROM profiles ORDER BY createdAt ASC;');
+  return rows.length > 0 ? rows : [DEFAULT_PROFILE];
 }
 
-export function saveAppSetting(key: 'monthlyBudget' | 'categoryLimitsEnabled', value: string): void {
+export function getActiveProfileId(): string {
   if (IS_WEB) {
     const s = getWebStorage<Record<string, string>>('exp_settings', {});
-    s[key] = value;
+    return s.activeProfileId || DEFAULT_PROFILE.id;
+  }
+
+  const db = getDatabase()!;
+  const row = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'activeProfileId';");
+  return row?.value || DEFAULT_PROFILE.id;
+}
+
+export function getActiveProfile(): Profile {
+  const activeId = getActiveProfileId();
+  const profiles = getAllProfiles();
+  return profiles.find((p) => p.id === activeId) || profiles[0] || DEFAULT_PROFILE;
+}
+
+export function setActiveProfileId(profileId: string): void {
+  if (IS_WEB) {
+    const s = getWebStorage<Record<string, string>>('exp_settings', {});
+    s.activeProfileId = profileId;
     setWebStorage('exp_settings', s);
     return;
   }
@@ -218,8 +393,184 @@ export function saveAppSetting(key: 'monthlyBudget' | 'categoryLimitsEnabled', v
   const db = getDatabase()!;
   db.runSync(
     'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;',
-    [key, value]
+    ['activeProfileId', profileId]
   );
+}
+
+export function createProfile(name: string, color = '#2563EB', icon = 'person'): Profile {
+  const trimmed = name.trim();
+  const id = 'profile_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+  const createdAt = new Date().toISOString();
+  const newProfile: Profile = {
+    id,
+    name: trimmed,
+    color,
+    icon,
+    createdAt,
+  };
+
+  if (IS_WEB) {
+    const list = getWebStorage<Profile[]>('exp_profiles', [DEFAULT_PROFILE]);
+    list.push(newProfile);
+    setWebStorage('exp_profiles', list);
+    return newProfile;
+  }
+
+  const db = getDatabase()!;
+  db.runSync(
+    'INSERT INTO profiles (id, name, color, icon, createdAt) VALUES (?, ?, ?, ?, ?);',
+    [newProfile.id, newProfile.name, newProfile.color, newProfile.icon, newProfile.createdAt]
+  );
+  return newProfile;
+}
+
+export function updateProfile(id: string, name: string, color?: string, icon?: string): void {
+  const trimmed = name.trim();
+  if (!trimmed) return;
+
+  if (IS_WEB) {
+    const list = getWebStorage<Profile[]>('exp_profiles', [DEFAULT_PROFILE]);
+    const idx = list.findIndex((p) => p.id === id);
+    if (idx !== -1) {
+      list[idx] = {
+        ...list[idx],
+        name: trimmed,
+        color: color || list[idx].color,
+        icon: icon || list[idx].icon,
+      };
+      setWebStorage('exp_profiles', list);
+    }
+    return;
+  }
+
+  const db = getDatabase()!;
+  const current = db.getFirstSync<Profile>('SELECT * FROM profiles WHERE id = ?;', [id]);
+  if (!current) return;
+
+  db.runSync(
+    'UPDATE profiles SET name = ?, color = ?, icon = ? WHERE id = ?;',
+    [trimmed, color || current.color, icon || current.icon, id]
+  );
+}
+
+export function deleteProfile(id: string): { success: boolean; message: string } {
+  const profiles = getAllProfiles();
+  if (profiles.length <= 1) {
+    return { success: false, message: 'You must have at least one profile.' };
+  }
+
+  const activeId = getActiveProfileId();
+
+  if (IS_WEB) {
+    const updated = profiles.filter((p) => p.id !== id);
+    setWebStorage('exp_profiles', updated);
+    const txs = getWebStorage<Transaction[]>('exp_transactions', []);
+    setWebStorage(
+      'exp_transactions',
+      txs.filter((t) => t.profileId !== id && (id !== 'profile_default' || !!t.profileId))
+    );
+    if (activeId === id) {
+      setActiveProfileId(updated[0].id);
+    }
+    return { success: true, message: 'Profile deleted successfully.' };
+  }
+
+  const db = getDatabase()!;
+  db.runSync('DELETE FROM profiles WHERE id = ?;', [id]);
+  db.runSync(
+    "DELETE FROM transactions WHERE profileId = ? OR (? = 'profile_default' AND (profileId IS NULL OR profileId = ''));",
+    [id, id]
+  );
+
+  if (activeId === id) {
+    const remaining = getAllProfiles();
+    if (remaining.length > 0) {
+      setActiveProfileId(remaining[0].id);
+    }
+  }
+
+  return { success: true, message: 'Profile deleted successfully.' };
+}
+
+export function getProfileStats(): {
+  profile: Profile;
+  balance: number;
+  income: number;
+  expense: number;
+  txCount: number;
+}[] {
+  const profiles = getAllProfiles();
+  return profiles.map((p) => {
+    const summ = getWalletSummary(undefined, p.id);
+    return {
+      profile: p,
+      balance: summ.totalBalance,
+      income: summ.totalIncome,
+      expense: summ.totalExpense,
+      txCount: summ.transactionCount,
+    };
+  });
+}
+
+// ----------------- Settings -----------------
+export function getAppSettings(profileId?: string): AppSettings {
+  const currentPid = profileId || getActiveProfileId();
+
+  if (IS_WEB) {
+    const s = getWebStorage<Record<string, string>>('exp_settings', {});
+    const budgetKey = `monthlyBudget_${currentPid}`;
+    const budgetVal = s[budgetKey] !== undefined ? s[budgetKey] : s.monthlyBudget;
+    return {
+      currency: '₹',
+      monthlyBudget: budgetVal ? parseFloat(budgetVal) || 0 : 0,
+      categoryLimitsEnabled: s.categoryLimitsEnabled === 'true',
+      activeProfileId: s.activeProfileId || DEFAULT_PROFILE.id,
+    };
+  }
+
+  const db = getDatabase()!;
+  const budgetKey = `monthlyBudget_${currentPid}`;
+  const budgetRow =
+    db.getFirstSync<{ value: string }>('SELECT value FROM settings WHERE key = ?;', [budgetKey]) ||
+    db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'monthlyBudget';");
+  const limitsRow = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'categoryLimitsEnabled';");
+  const activeProfileRow = db.getFirstSync<{ value: string }>("SELECT value FROM settings WHERE key = 'activeProfileId';");
+
+  return {
+    currency: '₹',
+    monthlyBudget: budgetRow ? parseFloat(budgetRow.value) || 0 : 0,
+    categoryLimitsEnabled: limitsRow?.value === 'true',
+    activeProfileId: activeProfileRow?.value || DEFAULT_PROFILE.id,
+  };
+}
+
+export function saveAppSetting(
+  key: 'monthlyBudget' | 'categoryLimitsEnabled' | 'activeProfileId',
+  value: string,
+  profileId?: string
+): void {
+  const currentPid = profileId || getActiveProfileId();
+  const effectiveKey = key === 'monthlyBudget' ? `monthlyBudget_${currentPid}` : key;
+
+  if (IS_WEB) {
+    const s = getWebStorage<Record<string, string>>('exp_settings', {});
+    s[effectiveKey] = value;
+    if (key === 'monthlyBudget') s.monthlyBudget = value;
+    setWebStorage('exp_settings', s);
+    return;
+  }
+
+  const db = getDatabase()!;
+  db.runSync(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;',
+    [effectiveKey, value]
+  );
+  if (key === 'monthlyBudget') {
+    db.runSync(
+      'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;',
+      ['monthlyBudget', value]
+    );
+  }
 }
 
 // ----------------- Category Limits -----------------
@@ -310,7 +661,8 @@ export function deleteCategoryLimit(categoryName: string): void {
   saveCategoryLimits(currentLimits);
 }
 
-export function getCategoryMonthlySpend(categoryName: string, month?: string): number {
+export function getCategoryMonthlySpend(categoryName: string, month?: string, profileId?: string): number {
+  const targetPid = profileId !== undefined ? profileId : getActiveProfileId();
   const targetMonth = month || getLocalYearMonth();
   const catLower = categoryName.trim().toLowerCase();
 
@@ -318,6 +670,10 @@ export function getCategoryMonthlySpend(categoryName: string, month?: string): n
     const list = getWebStorage<Transaction[]>('exp_transactions', []);
     return list
       .filter((t) => {
+        if (targetPid && targetPid !== 'all') {
+          const tPid = t.profileId || 'profile_default';
+          if (tPid !== targetPid) return false;
+        }
         if (t.type !== 'expense' || !t.date.startsWith(targetMonth)) return false;
         const tCat = t.category.toLowerCase();
         return (
@@ -337,6 +693,7 @@ export function getCategoryMonthlySpend(categoryName: string, month?: string): n
   const row = db.getFirstSync<{ total: number }>(
     `SELECT COALESCE(SUM(amount), 0) as total FROM transactions 
      WHERE type = 'expense' 
+       AND (profileId = $targetPid OR ($targetPid = 'profile_default' AND (profileId IS NULL OR profileId = '')))
        AND date LIKE $month 
        AND (
          LOWER(category) = $cat 
@@ -348,6 +705,7 @@ export function getCategoryMonthlySpend(categoryName: string, month?: string): n
          OR ($cat LIKE '%service%' AND LOWER(category) = 'service')
        );`,
     {
+      $targetPid: targetPid,
       $month: `${targetMonth}%`,
       $cat: catLower,
     }
@@ -355,15 +713,16 @@ export function getCategoryMonthlySpend(categoryName: string, month?: string): n
   return row ? row.total : 0;
 }
 
-export function getAllCategoryLimitStatuses(month?: string): CategoryLimitStatus[] {
+export function getAllCategoryLimitStatuses(month?: string, profileId?: string): CategoryLimitStatus[] {
   const limits = getCategoryLimits();
   const categories = getAllCategories();
   const targetMonth = month || getLocalYearMonth();
+  const targetPid = profileId !== undefined ? profileId : getActiveProfileId();
 
   const result: CategoryLimitStatus[] = [];
   for (const [catName, limit] of Object.entries(limits)) {
     if (limit <= 0) continue;
-    const spent = getCategoryMonthlySpend(catName, targetMonth);
+    const spent = getCategoryMonthlySpend(catName, targetMonth, targetPid);
     const remaining = limit - spent;
     const percent = Math.min(Math.round((spent / limit) * 100), 999);
     const matchCat = categories.find((c) => c.name.toLowerCase() === catName.toLowerCase());
@@ -435,6 +794,7 @@ export function addCustomCategory(
 }
 
 // ----------------- Transactions CRUD -----------------
+// ----------------- Transactions CRUD -----------------
 export function getTransactions(options?: {
   month?: string; // YYYY-MM or 'all'
   type?: TransactionType;
@@ -442,10 +802,16 @@ export function getTransactions(options?: {
   paymentMethod?: PaymentMethod;
   search?: string;
   limit?: number;
+  profileId?: string; // specific profile or default to activeProfileId
 }): Transaction[] {
+  const targetPid = options?.profileId !== undefined ? options.profileId : getActiveProfileId();
+
   if (IS_WEB) {
     let list = getWebStorage<Transaction[]>('exp_transactions', []);
 
+    if (targetPid && targetPid !== 'all') {
+      list = list.filter((t) => (t.profileId || 'profile_default') === targetPid);
+    }
     if (options?.month && options.month !== 'all') {
       list = list.filter((t) => t.date.startsWith(options.month!));
     }
@@ -475,6 +841,11 @@ export function getTransactions(options?: {
   const db = getDatabase()!;
   let query = 'SELECT * FROM transactions WHERE 1=1';
   const params: Record<string, string | number> = {};
+
+  if (targetPid && targetPid !== 'all') {
+    query += " AND (profileId = $targetPid OR ($targetPid = 'profile_default' AND (profileId IS NULL OR profileId = '')))";
+    params.$targetPid = targetPid;
+  }
 
   if (options?.month && options.month !== 'all') {
     query += ' AND date LIKE $month';
@@ -521,16 +892,19 @@ export function addTransaction(data: {
   paymentMethod: PaymentMethod;
   date: string;
   notes?: string;
+  profileId?: string;
 }): Transaction {
   const createdAt = new Date().toISOString();
   const method: PaymentMethod = data.paymentMethod === 'cash' ? 'cash' : 'upi';
   const normDate = normalizeDateString(data.date) || getLocalDateString();
+  const profileId = data.profileId || getActiveProfileId();
 
   if (IS_WEB) {
     const list = getWebStorage<Transaction[]>('exp_transactions', []);
     const newId = list.length > 0 ? Math.max(...list.map((t) => t.id)) + 1 : 1;
     const newTx: Transaction = {
       id: newId,
+      profileId,
       title: data.title.trim(),
       amount: data.amount,
       type: data.type,
@@ -549,9 +923,10 @@ export function addTransaction(data: {
 
   const db = getDatabase()!;
   const result = db.runSync(
-    `INSERT INTO transactions (title, amount, type, category, categoryIcon, categoryColor, paymentMethod, date, notes, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+    `INSERT INTO transactions (profileId, title, amount, type, category, categoryIcon, categoryColor, paymentMethod, date, notes, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
     [
+      profileId,
       data.title.trim(),
       data.amount,
       data.type,
@@ -567,6 +942,7 @@ export function addTransaction(data: {
 
   return {
     id: result.lastInsertRowId,
+    profileId,
     title: data.title.trim(),
     amount: data.amount,
     type: data.type,
@@ -592,6 +968,7 @@ export function updateTransaction(
     paymentMethod: PaymentMethod;
     date: string;
     notes?: string;
+    profileId?: string;
   }
 ): void {
   const method: PaymentMethod = data.paymentMethod === 'cash' ? 'cash' : 'upi';
@@ -603,6 +980,7 @@ export function updateTransaction(
     if (idx !== -1) {
       list[idx] = {
         ...list[idx],
+        profileId: data.profileId || list[idx].profileId || getActiveProfileId(),
         title: data.title.trim(),
         amount: data.amount,
         type: data.type,
@@ -619,23 +997,44 @@ export function updateTransaction(
   }
 
   const db = getDatabase()!;
-  db.runSync(
-    `UPDATE transactions
-     SET title = ?, amount = ?, type = ?, category = ?, categoryIcon = ?, categoryColor = ?, paymentMethod = ?, date = ?, notes = ?
-     WHERE id = ?;`,
-    [
-      data.title.trim(),
-      data.amount,
-      data.type,
-      data.category,
-      data.categoryIcon || 'pricetag',
-      data.categoryColor || '#64748B',
-      method,
-      normDate,
-      data.notes ? data.notes.trim() : '',
-      id,
-    ]
-  );
+  if (data.profileId) {
+    db.runSync(
+      `UPDATE transactions
+       SET profileId = ?, title = ?, amount = ?, type = ?, category = ?, categoryIcon = ?, categoryColor = ?, paymentMethod = ?, date = ?, notes = ?
+       WHERE id = ?;`,
+      [
+        data.profileId,
+        data.title.trim(),
+        data.amount,
+        data.type,
+        data.category,
+        data.categoryIcon || 'pricetag',
+        data.categoryColor || '#64748B',
+        method,
+        normDate,
+        data.notes ? data.notes.trim() : '',
+        id,
+      ]
+    );
+  } else {
+    db.runSync(
+      `UPDATE transactions
+       SET title = ?, amount = ?, type = ?, category = ?, categoryIcon = ?, categoryColor = ?, paymentMethod = ?, date = ?, notes = ?
+       WHERE id = ?;`,
+      [
+        data.title.trim(),
+        data.amount,
+        data.type,
+        data.category,
+        data.categoryIcon || 'pricetag',
+        data.categoryColor || '#64748B',
+        method,
+        normDate,
+        data.notes ? data.notes.trim() : '',
+        id,
+      ]
+    );
+  }
 }
 
 export function deleteTransaction(id: number): void {
@@ -653,11 +1052,15 @@ export function deleteTransaction(id: number): void {
 }
 
 // ----------------- Dual Wallet Summary (Cash vs UPI) -----------------
-export function getWalletSummary(month?: string): WalletSummary {
+export function getWalletSummary(month?: string, profileId?: string): WalletSummary {
+  const targetPid = profileId !== undefined ? profileId : getActiveProfileId();
   let transactions: Transaction[] = [];
 
   if (IS_WEB) {
     transactions = getWebStorage<Transaction[]>('exp_transactions', []);
+    if (targetPid && targetPid !== 'all') {
+      transactions = transactions.filter((t) => (t.profileId || 'profile_default') === targetPid);
+    }
     if (month && month !== 'all') {
       transactions = transactions.filter((t) => t.date.startsWith(month));
     }
@@ -665,6 +1068,10 @@ export function getWalletSummary(month?: string): WalletSummary {
     const db = getDatabase()!;
     let query = 'SELECT * FROM transactions WHERE 1=1';
     const params: Record<string, string> = {};
+    if (targetPid && targetPid !== 'all') {
+      query += " AND (profileId = $targetPid OR ($targetPid = 'profile_default' AND (profileId IS NULL OR profileId = '')))";
+      params.$targetPid = targetPid;
+    }
     if (month && month !== 'all') {
       query += ' AND date LIKE $month';
       params.$month = `${month}%`;
@@ -711,7 +1118,8 @@ export function getWalletSummary(month?: string): WalletSummary {
 }
 
 // ----------------- Category Breakdown with Cash & UPI -----------------
-export function getCategoryBreakdown(month?: string): CategorySpend[] {
+export function getCategoryBreakdown(month?: string, profileId?: string): CategorySpend[] {
+  const targetPid = profileId !== undefined ? profileId : getActiveProfileId();
   let list: Transaction[] = [];
 
   if (IS_WEB) {
@@ -719,6 +1127,10 @@ export function getCategoryBreakdown(month?: string): CategorySpend[] {
   } else {
     const db = getDatabase()!;
     list = db.getAllSync<Transaction>('SELECT * FROM transactions;');
+  }
+
+  if (targetPid && targetPid !== 'all') {
+    list = list.filter((t) => (t.profileId || 'profile_default') === targetPid);
   }
 
   list = list.filter((t) => t.type === 'expense');
@@ -770,7 +1182,8 @@ export function getCategoryBreakdown(month?: string): CategorySpend[] {
 }
 
 // ----------------- Monthly Trends (Cash & UPI separate) -----------------
-export function getMonthlyTrends(monthsCount = 6): MonthlySpend[] {
+export function getMonthlyTrends(monthsCount = 6, profileId?: string): MonthlySpend[] {
+  const targetPid = profileId !== undefined ? profileId : getActiveProfileId();
   const result: MonthlySpend[] = [];
   const now = new Date();
 
@@ -780,6 +1193,10 @@ export function getMonthlyTrends(monthsCount = 6): MonthlySpend[] {
   } else {
     const db = getDatabase()!;
     allTx = db.getAllSync<Transaction>('SELECT * FROM transactions;');
+  }
+
+  if (targetPid && targetPid !== 'all') {
+    allTx = allTx.filter((t) => (t.profileId || 'profile_default') === targetPid);
   }
 
   for (let i = monthsCount - 1; i >= 0; i--) {
@@ -813,13 +1230,18 @@ export function getMonthlyTrends(monthsCount = 6): MonthlySpend[] {
 }
 
 // ----------------- Daily Spend Histogram for Selected Month -----------------
-export function getDailySpendForMonth(month: string): DailySpend[] {
+export function getDailySpendForMonth(month: string, profileId?: string): DailySpend[] {
+  const targetPid = profileId !== undefined ? profileId : getActiveProfileId();
   let allTx: Transaction[] = [];
   if (IS_WEB) {
     allTx = getWebStorage<Transaction[]>('exp_transactions', []);
   } else {
     const db = getDatabase()!;
     allTx = db.getAllSync<Transaction>('SELECT * FROM transactions;');
+  }
+
+  if (targetPid && targetPid !== 'all') {
+    allTx = allTx.filter((t) => (t.profileId || 'profile_default') === targetPid);
   }
 
   const effectiveMonth = month === 'all' ? getLocalYearMonth() : month;
@@ -865,6 +1287,8 @@ export function getDailySpendForMonth(month: string): DailySpend[] {
 export function exportBackupData(): string {
   let transactions: Transaction[] = [];
   let categories: Category[] = [];
+  const profiles = getAllProfiles();
+  const activeProfileId = getActiveProfileId();
 
   if (IS_WEB) {
     transactions = getWebStorage<Transaction[]>('exp_transactions', []);
@@ -877,10 +1301,12 @@ export function exportBackupData(): string {
 
   return JSON.stringify(
     {
-      version: 3,
+      version: 4,
       currency: '₹',
       appName: 'Offline Cash & UPI Expense Tracker',
       exportedAt: new Date().toISOString(),
+      profiles,
+      activeProfileId,
       transactions,
       categories,
     },
@@ -889,11 +1315,15 @@ export function exportBackupData(): string {
   );
 }
 
-export function exportToCSV(): string {
-  const transactions = getTransactions();
-  const headers = ['ID', 'Date', 'Type', 'Wallet (Method)', 'Category', 'Title', 'Amount (INR)', 'Notes'];
+export function exportToCSV(profileId?: string): string {
+  const transactions = getTransactions({ profileId: profileId || 'all' });
+  const profiles = getAllProfiles();
+  const profileMap = new Map<string, string>(profiles.map((p) => [p.id, p.name]));
+
+  const headers = ['ID', 'Profile', 'Date', 'Type', 'Wallet (Method)', 'Category', 'Title', 'Amount (INR)', 'Notes'];
   const rows = transactions.map((t) => [
     t.id,
+    `"${(profileMap.get(t.profileId || '') || 'My Money').replace(/"/g, '""')}"`,
     `"${t.date}"`,
     `"${t.type.toUpperCase()}"`,
     `"${t.paymentMethod.toUpperCase()}"`,
@@ -913,6 +1343,25 @@ export function importBackupData(jsonString: string): { success: boolean; messag
       return { success: false, message: 'Invalid backup file format' };
     }
 
+    if (data.profiles && Array.isArray(data.profiles) && data.profiles.length > 0) {
+      if (IS_WEB) {
+        setWebStorage('exp_profiles', data.profiles);
+      } else {
+        const db = getDatabase()!;
+        db.runSync('DELETE FROM profiles;');
+        for (const p of data.profiles) {
+          db.runSync(
+            'INSERT OR REPLACE INTO profiles (id, name, color, icon, createdAt) VALUES (?, ?, ?, ?, ?);',
+            [p.id, p.name, p.color || '#2563EB', p.icon || 'person', p.createdAt || new Date().toISOString()]
+          );
+        }
+      }
+    }
+
+    if (data.activeProfileId) {
+      setActiveProfileId(data.activeProfileId);
+    }
+
     if (IS_WEB) {
       setWebStorage('exp_transactions', data.transactions);
       if (data.categories) setWebStorage('exp_categories', data.categories);
@@ -923,14 +1372,15 @@ export function importBackupData(jsonString: string): { success: boolean; messag
     db.runSync('DELETE FROM transactions;');
 
     const insertTx = db.prepareSync(
-      `INSERT INTO transactions (id, title, amount, type, category, categoryIcon, categoryColor, paymentMethod, date, notes, createdAt)
-       VALUES ($id, $title, $amount, $type, $category, $categoryIcon, $categoryColor, $paymentMethod, $date, $notes, $createdAt);`
+      `INSERT INTO transactions (id, profileId, title, amount, type, category, categoryIcon, categoryColor, paymentMethod, date, notes, createdAt)
+       VALUES ($id, $profileId, $title, $amount, $type, $category, $categoryIcon, $categoryColor, $paymentMethod, $date, $notes, $createdAt);`
     );
 
     try {
       for (const tx of data.transactions) {
         insertTx.executeSync({
           $id: tx.id,
+          $profileId: tx.profileId || 'profile_default',
           $title: tx.title,
           $amount: tx.amount,
           $type: tx.type,
@@ -953,14 +1403,23 @@ export function importBackupData(jsonString: string): { success: boolean; messag
   }
 }
 
-export function resetAllData(): void {
+export function resetAllData(profileId?: string): void {
+  const targetPid = profileId || getActiveProfileId();
+
   if (IS_WEB) {
-    setWebStorage('exp_transactions', []);
-    saveAppSetting('monthlyBudget', '0');
+    const list = getWebStorage<Transaction[]>('exp_transactions', []);
+    setWebStorage(
+      'exp_transactions',
+      list.filter((t) => t.profileId !== targetPid && (targetPid !== 'profile_default' || !!t.profileId))
+    );
+    saveAppSetting('monthlyBudget', '0', targetPid);
     return;
   }
 
   const db = getDatabase()!;
-  db.runSync('DELETE FROM transactions;');
-  db.runSync("UPDATE settings SET value = '0' WHERE key = 'monthlyBudget';");
+  db.runSync(
+    "DELETE FROM transactions WHERE profileId = ? OR (? = 'profile_default' AND (profileId IS NULL OR profileId = ''));",
+    [targetPid, targetPid]
+  );
+  saveAppSetting('monthlyBudget', '0', targetPid);
 }

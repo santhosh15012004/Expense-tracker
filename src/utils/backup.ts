@@ -51,9 +51,9 @@ export async function exportBackupToFile(): Promise<{ success: boolean; message:
   }
 }
 
-export async function exportToSpreadsheetCSV(): Promise<{ success: boolean; message: string }> {
+export async function exportToSpreadsheetCSV(profileId?: string): Promise<{ success: boolean; message: string }> {
   try {
-    const csvData = exportToCSV();
+    const csvData = exportToCSV(profileId);
     const timestamp = new Date().toISOString().slice(0, 10);
     const filename = `expenses_${timestamp}.csv`;
 
