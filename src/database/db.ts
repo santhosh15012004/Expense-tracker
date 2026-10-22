@@ -822,7 +822,7 @@ export function getTransactions(options?: {
       list = list.filter((t) => t.category === options.category);
     }
     if (options?.paymentMethod) {
-      list = list.filter((t) => t.paymentMethod === options.paymentMethod);
+      list = list.filter((t) => t.paymentMethod === options.paymentMethod || t.type === 'transfer');
     }
     if (options?.search && options.search.trim()) {
       const q = options.search.trim().toLowerCase();
@@ -863,7 +863,7 @@ export function getTransactions(options?: {
   }
 
   if (options?.paymentMethod) {
-    query += ' AND paymentMethod = $pm';
+    query += " AND (paymentMethod = $pm OR type = 'transfer')";
     params.$pm = options.paymentMethod;
   }
 
@@ -1083,20 +1083,35 @@ export function getWalletSummary(month?: string, profileId?: string): WalletSumm
   let cashExpense = 0;
   let upiIncome = 0;
   let upiExpense = 0;
+  let cashTransferIn = 0;
+  let cashTransferOut = 0;
+  let upiTransferIn = 0;
+  let upiTransferOut = 0;
 
   for (const t of transactions) {
     const isUpi = t.paymentMethod === 'upi';
     if (t.type === 'income') {
       if (isUpi) upiIncome += t.amount;
       else cashIncome += t.amount;
-    } else {
+    } else if (t.type === 'expense') {
       if (isUpi) upiExpense += t.amount;
       else cashExpense += t.amount;
+    } else if (t.type === 'transfer') {
+      // paymentMethod indicates the source wallet
+      if (isUpi) {
+        // UPI -> Cash (ATM Withdrawal)
+        upiTransferOut += t.amount;
+        cashTransferIn += t.amount;
+      } else {
+        // Cash -> UPI (Cash deposit to bank)
+        cashTransferOut += t.amount;
+        upiTransferIn += t.amount;
+      }
     }
   }
 
-  const cashBalance = cashIncome - cashExpense;
-  const upiBalance = upiIncome - upiExpense;
+  const cashBalance = cashIncome - cashExpense + cashTransferIn - cashTransferOut;
+  const upiBalance = upiIncome - upiExpense + upiTransferIn - upiTransferOut;
   const totalIncome = cashIncome + upiIncome;
   const totalExpense = cashExpense + upiExpense;
   const totalBalance = cashBalance + upiBalance;
@@ -1105,10 +1120,14 @@ export function getWalletSummary(month?: string, profileId?: string): WalletSumm
     cashBalance,
     cashIncome,
     cashExpense,
+    cashTransferIn,
+    cashTransferOut,
 
     upiBalance,
     upiIncome,
     upiExpense,
+    upiTransferIn,
+    upiTransferOut,
 
     totalBalance,
     totalIncome,
@@ -1321,17 +1340,26 @@ export function exportToCSV(profileId?: string): string {
   const profileMap = new Map<string, string>(profiles.map((p) => [p.id, p.name]));
 
   const headers = ['ID', 'Profile', 'Date', 'Type', 'Wallet (Method)', 'Category', 'Title', 'Amount (INR)', 'Notes'];
-  const rows = transactions.map((t) => [
-    t.id,
-    `"${(profileMap.get(t.profileId || '') || 'My Money').replace(/"/g, '""')}"`,
-    `"${t.date}"`,
-    `"${t.type.toUpperCase()}"`,
-    `"${t.paymentMethod.toUpperCase()}"`,
-    `"${t.category}"`,
-    `"${(t.title || '').replace(/"/g, '""')}"`,
-    t.amount,
-    `"${(t.notes || '').replace(/"/g, '""')}"`,
-  ]);
+  const rows = transactions.map((t) => {
+    const walletLabel =
+      t.type === 'transfer'
+        ? t.paymentMethod === 'cash'
+          ? 'CASH -> UPI'
+          : 'UPI -> CASH'
+        : t.paymentMethod.toUpperCase();
+
+    return [
+      t.id,
+      `"${(profileMap.get(t.profileId || '') || 'My Money').replace(/"/g, '""')}"`,
+      `"${t.date}"`,
+      `"${t.type.toUpperCase()}"`,
+      `"${walletLabel}"`,
+      `"${t.category}"`,
+      `"${(t.title || '').replace(/"/g, '""')}"`,
+      t.amount,
+      `"${(t.notes || '').replace(/"/g, '""')}"`,
+    ];
+  });
 
   return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
 }

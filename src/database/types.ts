@@ -1,5 +1,6 @@
-export type TransactionType = 'expense' | 'income';
+export type TransactionType = 'expense' | 'income' | 'transfer';
 export type PaymentMethod = 'cash' | 'upi';
+export type TransferDirection = 'cash_to_upi' | 'upi_to_cash';
 
 export interface Profile {
   id: string;
@@ -37,11 +38,15 @@ export interface WalletSummary {
   cashBalance: number;
   cashIncome: number;
   cashExpense: number;
+  cashTransferIn?: number;
+  cashTransferOut?: number;
 
   // UPI Wallet
   upiBalance: number;
   upiIncome: number;
   upiExpense: number;
+  upiTransferIn?: number;
+  upiTransferOut?: number;
 
   // Overall
   totalBalance: number;

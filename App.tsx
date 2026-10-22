@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import {
   StyleSheet,
   Text,
@@ -13,6 +13,8 @@ import {
   Image,
   KeyboardAvoidingView,
   Keyboard,
+  AppState,
+  AppStateStatus,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -72,6 +74,7 @@ import {
   getShiftedMonth,
   pad2,
 } from './src/utils/dateUtils';
+import SplashScreen from './src/components/SplashScreen';
 
 type TabType = 'home' | 'analytics' | 'history' | 'settings';
 type ChartMode = 'pie' | 'categoryBars' | 'dailyHistogram';
@@ -441,6 +444,27 @@ function DailyHistogramComponent({ data }: { data: DailySpend[] }) {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabType>('home');
+  const [showSplash, setShowSplash] = useState(true);
+  const [splashKey, setSplashKey] = useState(0);
+  const appState = useRef(AppState.currentState);
+
+  // Trigger splash screen on launch AND every time the user opens/reopens the app
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
+      if (
+        appState.current.match(/inactive|background/) &&
+        nextAppState === 'active'
+      ) {
+        setSplashKey((k) => k + 1);
+        setShowSplash(true);
+      }
+      appState.current = nextAppState;
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
 
   // Multi-Profile State (Like Instagram Account Switcher)
   const [profiles, setProfiles] = useState<Profile[]>([DEFAULT_PROFILE]);
@@ -496,7 +520,7 @@ export default function App() {
   const [selectedMonth, setSelectedMonth] = useState<string>(currentMonthStr);
   const [dashboardView, setDashboardView] = useState<'all' | 'month'>('all');
   const [historyPeriodFilter, setHistoryPeriodFilter] = useState<'all' | 'month'>('all');
-  const [historyTypeFilter, setHistoryTypeFilter] = useState<'all' | 'expense' | 'income'>('all');
+  const [historyTypeFilter, setHistoryTypeFilter] = useState<'all' | 'expense' | 'income' | 'transfer'>('all');
   const [historyWalletFilter, setHistoryWalletFilter] = useState<'all' | 'cash' | 'upi'>('all');
   const [historySearch, setHistorySearch] = useState('');
 
@@ -544,6 +568,7 @@ export default function App() {
       const monthTransactions = getTransactions({ month: monthToUse, profileId: activeProfile.id });
       const incTxs = monthTransactions.filter((t) => t.type === 'income');
       const expTxs = monthTransactions.filter((t) => t.type === 'expense');
+      const trfTxs = monthTransactions.filter((t) => t.type === 'transfer');
       const catBreakdown = getCategoryBreakdown(monthToUse, activeProfile.id);
 
       const result = await downloadMonthlyPdf({
@@ -552,6 +577,7 @@ export default function App() {
         summary: monthSummary,
         incomeTransactions: incTxs,
         expenseTransactions: expTxs,
+        transferTransactions: trfTxs,
         categoryBreakdown: catBreakdown,
       });
 
@@ -794,14 +820,28 @@ export default function App() {
     setEditingTransaction(null);
     setTxType(type);
     setPaymentMethod(method);
-    setTitle('');
+    setTitle(type === 'transfer' ? (method === 'cash' ? 'Hand to UPI Deposit' : 'ATM Cash Withdrawal') : '');
     setAmount('');
     setNotes('');
     setCustomCategoryInput('');
     setTxDate(getTodayDateString());
 
     const matchingCat = categories.find((c) => c.type === type) || categories[0] || null;
-    setSelectedCategory(matchingCat);
+    setSelectedCategory(type === 'transfer' ? null : matchingCat);
+    setModalVisible(true);
+  };
+
+  // Open Transfer Modal specifically (Hand ➔ UPI or UPI ➔ Hand)
+  const openTransferModal = (direction: 'cash_to_upi' | 'upi_to_cash' = 'cash_to_upi') => {
+    setEditingTransaction(null);
+    setTxType('transfer');
+    setPaymentMethod(direction === 'cash_to_upi' ? 'cash' : 'upi');
+    setTitle(direction === 'cash_to_upi' ? 'Hand to UPI Deposit' : 'ATM Cash Withdrawal');
+    setAmount('');
+    setNotes('');
+    setCustomCategoryInput('');
+    setTxDate(getTodayDateString());
+    setSelectedCategory(null);
     setModalVisible(true);
   };
 
@@ -814,6 +854,13 @@ export default function App() {
     setAmount(String(tx.amount));
     setNotes(tx.notes || '');
     setTxDate(tx.date);
+
+    if (tx.type === 'transfer') {
+      setSelectedCategory(null);
+      setCustomCategoryInput('');
+      setModalVisible(true);
+      return;
+    }
 
     const match = categories.find((c) => c.name.toLowerCase() === tx.category.toLowerCase()) || null;
     const isOtherCat = tx.category.toLowerCase().includes('other');
@@ -882,9 +929,19 @@ export default function App() {
   const handleTypeChange = (newType: TransactionType) => {
     setTxType(newType);
     setCustomCategoryInput('');
-    const firstMatchingCat = categories.find((c) => c.type === newType);
-    if (firstMatchingCat) {
-      setSelectedCategory(firstMatchingCat);
+    if (newType === 'transfer') {
+      setSelectedCategory(null);
+      if (!title || title === 'Hand to UPI Deposit' || title === 'ATM Cash Withdrawal' || title.startsWith('Transfer')) {
+        setTitle(paymentMethod === 'cash' ? 'Hand to UPI Deposit' : 'ATM Cash Withdrawal');
+      }
+    } else {
+      const firstMatchingCat = categories.find((c) => c.type === newType);
+      if (firstMatchingCat) {
+        setSelectedCategory(firstMatchingCat);
+      }
+      if (title === 'Hand to UPI Deposit' || title === 'ATM Cash Withdrawal') {
+        setTitle('');
+      }
     }
   };
 
@@ -895,14 +952,6 @@ export default function App() {
       Alert.alert('Invalid Amount', 'Please enter a valid amount greater than 0.');
       return;
     }
-    if (!title.trim()) {
-      Alert.alert('Missing Description', 'Please enter a title (e.g. Chai, Groceries, Salary).');
-      return;
-    }
-    if (!selectedCategory) {
-      Alert.alert('Select Category', 'Please select a category.');
-      return;
-    }
 
     const normDate = normalizeDateString(txDate);
     if (!normDate) {
@@ -910,6 +959,65 @@ export default function App() {
         'Invalid Date',
         'Please enter a valid date.\nAccepted formats:\n• YYYY-MM-DD (e.g. 2026-10-02)\n• DD-MM-YYYY (e.g. 02-10-2026)\n• Or tap Yesterday / Calendar button'
       );
+      return;
+    }
+
+    // Special Transfer Logic
+    if (txType === 'transfer') {
+      const defaultTransferTitle = paymentMethod === 'cash' ? 'Hand to UPI Deposit' : 'ATM Cash Withdrawal';
+      const finalTitle = title.trim() || defaultTransferTitle;
+      const catName = paymentMethod === 'cash' ? 'Hand ➔ UPI' : 'UPI ➔ Hand';
+      const catColor = paymentMethod === 'cash' ? '#6366F1' : '#0EA5E9';
+
+      try {
+        if (editingTransaction) {
+          updateTransaction(editingTransaction.id, {
+            title: finalTitle,
+            amount: parsedAmount,
+            type: 'transfer',
+            category: catName,
+            categoryIcon: 'swap-horizontal',
+            categoryColor: catColor,
+            paymentMethod,
+            date: normDate,
+            notes: notes.trim(),
+            profileId: editingTransaction.profileId || activeProfile.id,
+          });
+        } else {
+          addTransaction({
+            title: finalTitle,
+            amount: parsedAmount,
+            type: 'transfer',
+            category: catName,
+            categoryIcon: 'swap-horizontal',
+            categoryColor: catColor,
+            paymentMethod,
+            date: normDate,
+            notes: notes.trim(),
+            profileId: activeProfile.id,
+          });
+        }
+
+        const txMonth = normDate.slice(0, 7);
+        if (selectedMonth !== txMonth) {
+          setSelectedMonth(txMonth);
+        }
+
+        setModalVisible(false);
+        setCustomCategoryInput('');
+        loadAllData();
+      } catch (e: any) {
+        Alert.alert('Error', e?.message || 'Failed to save transfer');
+      }
+      return;
+    }
+
+    if (!title.trim()) {
+      Alert.alert('Missing Description', 'Please enter a title (e.g. Chai, Groceries, Salary).');
+      return;
+    }
+    if (!selectedCategory) {
+      Alert.alert('Select Category', 'Please select a category.');
       return;
     }
 
@@ -1098,7 +1206,8 @@ export default function App() {
   };
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <View style={styles.rootWrapper}>
+      <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
       <View style={styles.appContainer}>
         {/* Top Header */}
@@ -1262,8 +1371,17 @@ export default function App() {
 
               {/* SEPARATE WALLETS: CASH vs UPI (Real Cumulative Accounts) */}
               <View style={styles.sectionHeaderRow}>
-                <Text style={styles.sectionTitle}>My Wallets & Accounts</Text>
-                <Text style={styles.walletHint}>Real All-Time Balances</Text>
+                <View>
+                  <Text style={styles.sectionTitle}>My Wallets & Accounts</Text>
+                  <Text style={styles.walletHint}>Real All-Time Balances</Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.headerTransferBtn}
+                  onPress={() => openTransferModal('cash_to_upi')}
+                >
+                  <Ionicons name="swap-horizontal" size={15} color="#4F46E5" />
+                  <Text style={styles.headerTransferBtnText}>⇄ Transfer</Text>
+                </TouchableOpacity>
               </View>
 
               <View style={styles.walletsContainer}>
@@ -1421,23 +1539,31 @@ export default function App() {
                   style={[styles.quickActionBtn, { borderColor: '#4F46E5', backgroundColor: '#EEF2FF' }]}
                   onPress={() => openAddModal('expense', 'upi')}
                 >
-                  <Ionicons name="qr-code-outline" size={18} color="#4F46E5" />
-                  <Text style={[styles.quickActionText, { color: '#4F46E5' }]}>+ Add UPI</Text>
+                  <Ionicons name="qr-code-outline" size={16} color="#4F46E5" />
+                  <Text style={[styles.quickActionText, { color: '#4F46E5' }]}>+ UPI</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
                   style={[styles.quickActionBtn, { borderColor: '#059669', backgroundColor: '#ECFDF5' }]}
                   onPress={() => openAddModal('expense', 'cash')}
                 >
-                  <Ionicons name="cash-outline" size={18} color="#059669" />
-                  <Text style={[styles.quickActionText, { color: '#059669' }]}>+ Add Cash</Text>
+                  <Ionicons name="cash-outline" size={16} color="#059669" />
+                  <Text style={[styles.quickActionText, { color: '#059669' }]}>+ Cash</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.quickActionBtn, { borderColor: '#6366F1', backgroundColor: '#F5F3FF' }]}
+                  onPress={() => openTransferModal('cash_to_upi')}
+                >
+                  <Ionicons name="swap-horizontal" size={16} color="#4F46E5" />
+                  <Text style={[styles.quickActionText, { color: '#4F46E5' }]}>⇄ Transfer</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
                   style={[styles.quickActionBtn, { borderColor: '#CBD5E1', backgroundColor: '#FFFFFF' }]}
                   onPress={() => openAddModal('income', 'upi')}
                 >
-                  <Ionicons name="arrow-down-circle-outline" size={18} color="#16A34A" />
+                  <Ionicons name="arrow-down-circle-outline" size={16} color="#16A34A" />
                   <Text style={[styles.quickActionText, { color: '#16A34A' }]}>+ Income</Text>
                 </TouchableOpacity>
               </View>
@@ -1487,16 +1613,28 @@ export default function App() {
                         <View
                           style={[
                             styles.walletPillSmall,
-                            item.paymentMethod === 'upi' ? styles.upiPill : styles.cashPill,
+                            item.type === 'transfer'
+                              ? styles.transferPill
+                              : item.paymentMethod === 'upi'
+                              ? styles.upiPill
+                              : styles.cashPill,
                           ]}
                         >
                           <Text
                             style={[
                               styles.walletPillSmallText,
-                              item.paymentMethod === 'upi' ? styles.upiPillText : styles.cashPillText,
+                              item.type === 'transfer'
+                                ? styles.transferPillText
+                                : item.paymentMethod === 'upi'
+                                ? styles.upiPillText
+                                : styles.cashPillText,
                             ]}
                           >
-                            {item.paymentMethod.toUpperCase()}
+                            {item.type === 'transfer'
+                              ? item.paymentMethod === 'cash'
+                                ? 'HAND ➔ UPI'
+                                : 'UPI ➔ HAND'
+                              : item.paymentMethod.toUpperCase()}
                           </Text>
                         </View>
                         <Text
@@ -1513,11 +1651,18 @@ export default function App() {
                       <Text
                         style={[
                           styles.transactionAmount,
-                          { color: item.type === 'income' ? '#16A34A' : '#DC2626' },
+                          {
+                            color:
+                              item.type === 'income'
+                                ? '#16A34A'
+                                : item.type === 'transfer'
+                                ? '#4F46E5'
+                                : '#DC2626',
+                          },
                         ]}
                         numberOfLines={1}
                       >
-                        {item.type === 'income' ? '+' : '-'}
+                        {item.type === 'income' ? '+' : item.type === 'transfer' ? '⇄ ' : '-'}
                         {formatINR(item.amount)}
                       </Text>
                     </View>
@@ -1905,9 +2050,9 @@ export default function App() {
                   ))}
                 </View>
 
-                {/* Type Filter (All / Expense / Income) */}
+                {/* Type Filter (All / Expense / Income / Transfer) */}
                 <View style={styles.typeFilterGroup}>
-                  {(['all', 'expense', 'income'] as const).map((t) => (
+                  {(['all', 'expense', 'income', 'transfer'] as const).map((t) => (
                     <TouchableOpacity
                       key={t}
                       style={[
@@ -1922,7 +2067,7 @@ export default function App() {
                           historyTypeFilter === t && styles.activeTypeFilterPillText,
                         ]}
                       >
-                        {t.charAt(0).toUpperCase() + t.slice(1)}
+                        {t === 'transfer' ? '⇄ Transfer' : t.charAt(0).toUpperCase() + t.slice(1)}
                       </Text>
                     </TouchableOpacity>
                   ))}
@@ -1990,16 +2135,28 @@ export default function App() {
                             <View
                               style={[
                                 styles.walletPillSmall,
-                                item.paymentMethod === 'upi' ? styles.upiPill : styles.cashPill,
+                                item.type === 'transfer'
+                                  ? styles.transferPill
+                                  : item.paymentMethod === 'upi'
+                                  ? styles.upiPill
+                                  : styles.cashPill,
                               ]}
                             >
                               <Text
                                 style={[
                                   styles.walletPillSmallText,
-                                  item.paymentMethod === 'upi' ? styles.upiPillText : styles.cashPillText,
+                                  item.type === 'transfer'
+                                    ? styles.transferPillText
+                                    : item.paymentMethod === 'upi'
+                                    ? styles.upiPillText
+                                    : styles.cashPillText,
                                 ]}
                               >
-                                {item.paymentMethod.toUpperCase()}
+                                {item.type === 'transfer'
+                                  ? item.paymentMethod === 'cash'
+                                    ? 'HAND ➔ UPI'
+                                    : 'UPI ➔ HAND'
+                                  : item.paymentMethod.toUpperCase()}
                               </Text>
                             </View>
                             <Text
@@ -2022,11 +2179,18 @@ export default function App() {
                         <Text
                           style={[
                             styles.transactionAmount,
-                            { color: item.type === 'income' ? '#16A34A' : '#DC2626' },
+                            {
+                              color:
+                                item.type === 'income'
+                                  ? '#16A34A'
+                                  : item.type === 'transfer'
+                                  ? '#4F46E5'
+                                  : '#DC2626',
+                            },
                           ]}
                           numberOfLines={1}
                         >
-                          {item.type === 'income' ? '+' : '-'}
+                          {item.type === 'income' ? '+' : item.type === 'transfer' ? '⇄ ' : '-'}
                           {formatINR(item.amount)}
                         </Text>
 
@@ -2428,6 +2592,25 @@ export default function App() {
                 </TouchableOpacity>
               </View>
 
+              {/* Preview Splash Screen */}
+              <TouchableOpacity
+                style={styles.splashPreviewBtn}
+                onPress={() => {
+                  setSplashKey((k) => k + 1);
+                  setShowSplash(true);
+                }}
+                activeOpacity={0.8}
+              >
+                <View style={styles.splashPreviewIconBg}>
+                  <Ionicons name="sparkles" size={18} color="#D97706" />
+                </View>
+                <View style={{ flex: 1, marginLeft: 12 }}>
+                  <Text style={styles.splashPreviewTitle}>Preview Splash Screen</Text>
+                  <Text style={styles.splashPreviewDesc}>Replay 4-second gold luxury introduction</Text>
+                </View>
+                <Ionicons name="play-circle" size={22} color="#D97706" />
+              </TouchableOpacity>
+
               {/* Privacy Footer */}
               <View style={styles.aboutCard}>
                 <Ionicons name="shield-checkmark" size={20} color="#16A34A" />
@@ -2538,7 +2721,7 @@ export default function App() {
                 keyboardDismissMode="on-drag"
                 contentContainerStyle={styles.modalScrollContent}
               >
-                {/* 1. Transaction Type (Expense vs Income) */}
+                {/* 1. Transaction Type (Expense vs Income vs Transfer) */}
                 <View style={styles.typeSelector}>
                   <TouchableOpacity
                     style={[styles.typeButton, txType === 'expense' && styles.typeButtonActiveExpense]}
@@ -2567,55 +2750,153 @@ export default function App() {
                       Income
                     </Text>
                   </TouchableOpacity>
-                </View>
-
-                {/* 2. CHOOSE WALLET: CASH vs UPI (Crucial Feature) */}
-                <Text style={styles.inputLabel}>Select Wallet / Account</Text>
-                <View style={styles.walletPickRow}>
-                  <TouchableOpacity
-                    style={[
-                      styles.walletPickBtn,
-                      paymentMethod === 'upi' && styles.walletPickBtnActiveUpi,
-                    ]}
-                    onPress={() => setPaymentMethod('upi')}
-                  >
-                    <Ionicons
-                      name="qr-code-outline"
-                      size={18}
-                      color={paymentMethod === 'upi' ? '#4F46E5' : '#64748B'}
-                    />
-                    <Text
-                      style={[
-                        styles.walletPickBtnText,
-                        paymentMethod === 'upi' && styles.walletPickBtnTextActiveUpi,
-                      ]}
-                    >
-                      📱 UPI (GPay/PhonePe)
-                    </Text>
-                  </TouchableOpacity>
 
                   <TouchableOpacity
-                    style={[
-                      styles.walletPickBtn,
-                      paymentMethod === 'cash' && styles.walletPickBtnActiveCash,
-                    ]}
-                    onPress={() => setPaymentMethod('cash')}
+                    style={[styles.typeButton, txType === 'transfer' && styles.typeButtonActiveTransfer]}
+                    onPress={() => handleTypeChange('transfer')}
                   >
-                    <Ionicons
-                      name="cash-outline"
-                      size={18}
-                      color={paymentMethod === 'cash' ? '#059669' : '#64748B'}
-                    />
                     <Text
                       style={[
-                        styles.walletPickBtnText,
-                        paymentMethod === 'cash' && styles.walletPickBtnTextActiveCash,
+                        styles.typeButtonText,
+                        txType === 'transfer' && styles.typeButtonTextActive,
                       ]}
                     >
-                      💵 Cash in Hand
+                      ⇄ Transfer
                     </Text>
                   </TouchableOpacity>
                 </View>
+
+                {/* 2. CHOOSE TRANSFER DIRECTION OR WALLET */}
+                {txType === 'transfer' ? (
+                  <View style={styles.transferDirectionSection}>
+                    <Text style={styles.inputLabel}>Choose Transfer Direction</Text>
+                    <View style={styles.transferOptionsRow}>
+                      {/* Option A: Hand to UPI */}
+                      <TouchableOpacity
+                        style={[
+                          styles.transferOptionCard,
+                          paymentMethod === 'cash' && styles.transferOptionCardActiveCashToUpi,
+                        ]}
+                        onPress={() => {
+                          setPaymentMethod('cash');
+                          if (!title || title === 'ATM Cash Withdrawal' || title === 'Hand to UPI Deposit' || title.startsWith('Transfer:')) {
+                            setTitle('Hand to UPI Deposit');
+                          }
+                        }}
+                      >
+                        <View style={styles.transferOptionHeader}>
+                          <Text style={styles.transferOptionEmoji}>💵 ➔ 📱</Text>
+                          <View style={[styles.transferBadgeMini, paymentMethod === 'cash' && styles.transferBadgeMiniActiveCash]}>
+                            <Text style={[styles.transferBadgeMiniText, paymentMethod === 'cash' && styles.transferBadgeMiniTextActive]}>
+                              Deposit
+                            </Text>
+                          </View>
+                        </View>
+                        <Text style={[styles.transferOptionTitle, paymentMethod === 'cash' && styles.transferOptionTitleActive]}>
+                          Hand to UPI
+                        </Text>
+                        <Text style={styles.transferOptionSub}>
+                          Deposit cash into bank / GPay / PhonePe
+                        </Text>
+                        <Text style={styles.transferAvailText}>
+                          In Hand: {formatINR(allTimeWallet.cashBalance)}
+                        </Text>
+                      </TouchableOpacity>
+
+                      {/* Option B: UPI to Hand */}
+                      <TouchableOpacity
+                        style={[
+                          styles.transferOptionCard,
+                          paymentMethod === 'upi' && styles.transferOptionCardActiveUpiToCash,
+                        ]}
+                        onPress={() => {
+                          setPaymentMethod('upi');
+                          if (!title || title === 'Hand to UPI Deposit' || title === 'ATM Cash Withdrawal' || title.startsWith('Transfer:')) {
+                            setTitle('ATM Cash Withdrawal');
+                          }
+                        }}
+                      >
+                        <View style={styles.transferOptionHeader}>
+                          <Text style={styles.transferOptionEmoji}>📱 ➔ 💵</Text>
+                          <View style={[styles.transferBadgeMini, paymentMethod === 'upi' && styles.transferBadgeMiniActiveUpi]}>
+                            <Text style={[styles.transferBadgeMiniText, paymentMethod === 'upi' && styles.transferBadgeMiniTextActive]}>
+                              Withdraw
+                            </Text>
+                          </View>
+                        </View>
+                        <Text style={[styles.transferOptionTitle, paymentMethod === 'upi' && styles.transferOptionTitleActive]}>
+                          UPI to Hand
+                        </Text>
+                        <Text style={styles.transferOptionSub}>
+                          ATM cash withdrawal / Cash out
+                        </Text>
+                        <Text style={styles.transferAvailText}>
+                          UPI Bal: {formatINR(allTimeWallet.upiBalance)}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {/* Explanatory summary card */}
+                    <View style={styles.transferInfoBox}>
+                      <Ionicons name="information-circle-outline" size={16} color="#4F46E5" style={{ marginRight: 6 }} />
+                      <Text style={styles.transferInfoText}>
+                        {paymentMethod === 'cash'
+                          ? '💵 Cash in Hand will decrease & 📱 UPI Balance will increase. Overall Net Balance remains unchanged.'
+                          : '📱 UPI Balance will decrease & 💵 Cash in Hand will increase. Overall Net Balance remains unchanged.'}
+                      </Text>
+                    </View>
+                  </View>
+                ) : (
+                  <>
+                    {/* 2. CHOOSE WALLET: CASH vs UPI (Crucial Feature) */}
+                    <Text style={styles.inputLabel}>Select Wallet / Account</Text>
+                    <View style={styles.walletPickRow}>
+                      <TouchableOpacity
+                        style={[
+                          styles.walletPickBtn,
+                          paymentMethod === 'upi' && styles.walletPickBtnActiveUpi,
+                        ]}
+                        onPress={() => setPaymentMethod('upi')}
+                      >
+                        <Ionicons
+                          name="qr-code-outline"
+                          size={18}
+                          color={paymentMethod === 'upi' ? '#4F46E5' : '#64748B'}
+                        />
+                        <Text
+                          style={[
+                            styles.walletPickBtnText,
+                            paymentMethod === 'upi' && styles.walletPickBtnTextActiveUpi,
+                          ]}
+                        >
+                          📱 UPI (GPay/PhonePe)
+                        </Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity
+                        style={[
+                          styles.walletPickBtn,
+                          paymentMethod === 'cash' && styles.walletPickBtnActiveCash,
+                        ]}
+                        onPress={() => setPaymentMethod('cash')}
+                      >
+                        <Ionicons
+                          name="cash-outline"
+                          size={18}
+                          color={paymentMethod === 'cash' ? '#059669' : '#64748B'}
+                        />
+                        <Text
+                          style={[
+                            styles.walletPickBtnText,
+                            paymentMethod === 'cash' && styles.walletPickBtnTextActiveCash,
+                          ]}
+                        >
+                          💵 Cash in Hand
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  </>
+                )}
 
                 {/* 3. Amount Input in ₹ */}
                 <Text style={styles.inputLabel}>Amount (₹)</Text>
@@ -2627,181 +2908,222 @@ export default function App() {
                   value={amount}
                   onChangeText={setAmount}
                 />
+                {txType === 'transfer' && (
+                  <View style={styles.transferAmountPresetsRow}>
+                    {[500, 1000, 2000, 5000].map((amt) => (
+                      <TouchableOpacity
+                        key={amt}
+                        style={styles.transferAmountPresetChip}
+                        onPress={() => setAmount(String(amt))}
+                      >
+                        <Text style={styles.transferAmountPresetChipText}>+₹{amt}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                )}
 
                 {/* 4. Title / Description */}
-                <Text style={styles.inputLabel}>Description / Title</Text>
+                <Text style={styles.inputLabel}>
+                  {txType === 'transfer' ? 'Transfer Description' : 'Description / Title'}
+                </Text>
                 <TextInput
                   style={styles.input}
-                  placeholder="e.g. Chai, Auto, Groceries, Salary"
+                  placeholder={
+                    txType === 'transfer'
+                      ? paymentMethod === 'cash'
+                        ? 'e.g. Hand to UPI Deposit, Bank CDM'
+                        : 'e.g. ATM Cash Withdrawal'
+                      : 'e.g. Chai, Auto, Groceries, Salary'
+                  }
                   placeholderTextColor="#94A3B8"
                   value={title}
                   onChangeText={setTitle}
                 />
-
-                {/* 5. Category Horizontal Scroll */}
-                <Text style={styles.inputLabel}>Category</Text>
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  style={styles.categoryScroll}
-                >
-                  {filteredCategories.map((cat) => {
-                    const isSelected = selectedCategory?.name === cat.name;
-                    const catStatus =
-                      categoryLimitsEnabled && txType === 'expense'
-                        ? categoryLimitStatuses.find(
-                            (s) =>
-                              s.category.toLowerCase() === cat.name.toLowerCase() ||
-                              (s.category.toLowerCase() === 'food' && cat.name.toLowerCase().includes('food')) ||
-                              (cat.name.toLowerCase() === 'food' && s.category.toLowerCase().includes('food')) ||
-                              (s.category.toLowerCase() === 'petrol' && cat.name.toLowerCase().includes('petrol')) ||
-                              (cat.name.toLowerCase() === 'petrol' && s.category.toLowerCase().includes('petrol')) ||
-                              (s.category.toLowerCase() === 'service' && cat.name.toLowerCase().includes('service')) ||
-                              (cat.name.toLowerCase() === 'service' && s.category.toLowerCase().includes('service'))
-                          )
-                        : null;
-
-                    return (
+                {txType === 'transfer' && (
+                  <View style={styles.transferPresetChipsRow}>
+                    {(paymentMethod === 'cash'
+                      ? ['Hand to UPI Deposit', 'Deposited at CDM/Branch', 'Gave cash, friend UPI-ed', 'Self Deposit']
+                      : ['ATM Cash Withdrawal', 'Self Withdrawal', 'Friend gave cash for UPI', 'Branch Cash Out']
+                    ).map((preset) => (
                       <TouchableOpacity
-                        key={cat.id}
-                        style={[
-                          styles.categoryChip,
-                          isSelected && {
-                            borderColor: cat.color,
-                            backgroundColor: cat.color + '1A',
-                          },
-                        ]}
-                        onPress={() => setSelectedCategory(cat)}
+                        key={preset}
+                        style={styles.transferPresetChip}
+                        onPress={() => setTitle(preset)}
                       >
-                        <Ionicons
-                          name={cat.icon as any}
-                          size={16}
-                          color={isSelected ? cat.color : '#64748B'}
-                        />
-                        <View style={{ alignItems: 'flex-start' }}>
-                          <Text
-                            style={[
-                              styles.categoryChipText,
-                              isSelected && { color: cat.color, fontWeight: '700' },
-                            ]}
-                          >
-                            {cat.name}
-                          </Text>
-                          {catStatus && (
-                            <Text
-                              style={[
-                                styles.categoryChipLimitBadge,
-                                catStatus.isOverLimit && { color: '#DC2626', backgroundColor: '#FEE2E2' },
-                              ]}
-                            >
-                              ₹{catStatus.remaining > 0 ? `${catStatus.remaining}` : '0'} left
-                            </Text>
-                          )}
-                        </View>
+                        <Text style={styles.transferPresetChipText}>{preset}</Text>
                       </TouchableOpacity>
-                    );
-                  })}
-                </ScrollView>
-
-                {/* Live Category Budget Info Banner */}
-                {categoryLimitsEnabled && txType === 'expense' && activeLimitStatus && (
-                  <View style={styles.catBudgetBanner}>
-                    <View style={styles.catBudgetTopRow}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                        <Ionicons name="speedometer-outline" size={16} color="#2563EB" />
-                        <Text style={styles.catBudgetTitle}>
-                          {activeLimitStatus.category} Monthly Budget
-                        </Text>
-                      </View>
-                      <View
-                        style={[
-                          styles.catRemainingBadge,
-                          remainingAfterAmount < 0
-                            ? styles.catRemainingBadgeDanger
-                            : remainingAfterAmount < activeLimitStatus.limit * 0.2
-                            ? styles.catRemainingBadgeWarning
-                            : styles.catRemainingBadgeSuccess,
-                        ]}
-                      >
-                        <Text
-                          style={[
-                            styles.catRemainingBadgeText,
-                            remainingAfterAmount < 0
-                              ? styles.catRemainingBadgeTextDanger
-                              : remainingAfterAmount < activeLimitStatus.limit * 0.2
-                              ? styles.catRemainingBadgeTextWarning
-                              : styles.catRemainingBadgeTextSuccess,
-                          ]}
-                        >
-                          {remainingAfterAmount >= 0
-                            ? `${formatINR(remainingAfterAmount)} left`
-                            : `Over by ${formatINR(Math.abs(remainingAfterAmount))}`}
-                        </Text>
-                      </View>
-                    </View>
-
-                    <View style={styles.catBudgetDetailsRow}>
-                      <Text style={styles.catBudgetSubText}>
-                        Limit: <Text style={{ fontWeight: '700', color: '#0F172A' }}>{formatINR(activeLimitStatus.limit)}</Text>
-                      </Text>
-                      <Text style={styles.catBudgetSubText}>
-                        Spent so far: <Text style={{ fontWeight: '700', color: '#DC2626' }}>{formatINR(currentSpentAdjusted)}</Text>
-                      </Text>
-                      {enteredAmountNum > 0 && (
-                        <Text style={styles.catBudgetSubText}>
-                          This bill: <Text style={{ fontWeight: '700', color: '#2563EB' }}>-{formatINR(enteredAmountNum)}</Text>
-                        </Text>
-                      )}
-                    </View>
-
-                    {/* Progress Bar */}
-                    <View style={styles.progressBarBg}>
-                      <View
-                        style={[
-                          styles.progressBarFill,
-                          {
-                            width: `${Math.min(calculatedUsedPercent, 100)}%`,
-                            backgroundColor:
-                              remainingAfterAmount < 0
-                                ? '#DC2626'
-                                : calculatedUsedPercent > 80
-                                ? '#F59E0B'
-                                : '#10B981',
-                          },
-                        ]}
-                      />
-                    </View>
-
-                    {remainingAfterAmount < 0 && (
-                      <Text style={styles.catBudgetWarningText}>
-                        ⚠️ This expense will exceed your monthly limit for {activeLimitStatus.category} by {formatINR(Math.abs(remainingAfterAmount))}!
-                      </Text>
-                    )}
+                    ))}
                   </View>
                 )}
 
-                {/* 5.1 Custom Category Input (When 'Other' category is selected) */}
-                {selectedCategory &&
-                  (selectedCategory.name.toLowerCase().includes('other') ||
-                    selectedCategory.id.includes('other')) && (
-                    <View style={styles.customCatBox}>
-                      <View style={styles.customCatHeader}>
-                        <Ionicons name="sparkles" size={15} color="#4F46E5" />
-                        <Text style={styles.customCatTitle}>Specify Custom Category Name</Text>
+                {/* 5. Category Horizontal Scroll (Expenses & Income Only) */}
+                {txType !== 'transfer' && (
+                  <>
+                    <Text style={styles.inputLabel}>Category</Text>
+                    <ScrollView
+                      horizontal
+                      showsHorizontalScrollIndicator={false}
+                      style={styles.categoryScroll}
+                    >
+                      {filteredCategories.map((cat) => {
+                        const isSelected = selectedCategory?.name === cat.name;
+                        const catStatus =
+                          categoryLimitsEnabled && txType === 'expense'
+                            ? categoryLimitStatuses.find(
+                                (s) =>
+                                  s.category.toLowerCase() === cat.name.toLowerCase() ||
+                                  (s.category.toLowerCase() === 'food' && cat.name.toLowerCase().includes('food')) ||
+                                  (cat.name.toLowerCase() === 'food' && s.category.toLowerCase().includes('food')) ||
+                                  (s.category.toLowerCase() === 'petrol' && cat.name.toLowerCase().includes('petrol')) ||
+                                  (cat.name.toLowerCase() === 'petrol' && s.category.toLowerCase().includes('petrol')) ||
+                                  (s.category.toLowerCase() === 'service' && cat.name.toLowerCase().includes('service')) ||
+                                  (cat.name.toLowerCase() === 'service' && s.category.toLowerCase().includes('service'))
+                              )
+                            : null;
+
+                        return (
+                          <TouchableOpacity
+                            key={cat.id}
+                            style={[
+                              styles.categoryChip,
+                              isSelected && {
+                                borderColor: cat.color,
+                                backgroundColor: cat.color + '1A',
+                              },
+                            ]}
+                            onPress={() => setSelectedCategory(cat)}
+                          >
+                            <Ionicons
+                              name={cat.icon as any}
+                              size={16}
+                              color={isSelected ? cat.color : '#64748B'}
+                            />
+                            <View style={{ alignItems: 'flex-start' }}>
+                              <Text
+                                style={[
+                                  styles.categoryChipText,
+                                  isSelected && { color: cat.color, fontWeight: '700' },
+                                ]}
+                              >
+                                {cat.name}
+                              </Text>
+                              {catStatus && (
+                                <Text
+                                  style={[
+                                    styles.categoryChipLimitBadge,
+                                    catStatus.isOverLimit && { color: '#DC2626', backgroundColor: '#FEE2E2' },
+                                  ]}
+                                >
+                                  ₹{catStatus.remaining > 0 ? `${catStatus.remaining}` : '0'} left
+                                </Text>
+                              )}
+                            </View>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </ScrollView>
+
+                    {/* Live Category Budget Info Banner */}
+                    {categoryLimitsEnabled && txType === 'expense' && activeLimitStatus && (
+                      <View style={styles.catBudgetBanner}>
+                        <View style={styles.catBudgetTopRow}>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                            <Ionicons name="speedometer-outline" size={16} color="#2563EB" />
+                            <Text style={styles.catBudgetTitle}>
+                              {activeLimitStatus.category} Monthly Budget
+                            </Text>
+                          </View>
+                          <View
+                            style={[
+                              styles.catRemainingBadge,
+                              remainingAfterAmount < 0
+                                ? styles.catRemainingBadgeDanger
+                                : remainingAfterAmount < activeLimitStatus.limit * 0.2
+                                ? styles.catRemainingBadgeWarning
+                                : styles.catRemainingBadgeSuccess,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                styles.catRemainingBadgeText,
+                                remainingAfterAmount < 0
+                                ? styles.catRemainingBadgeTextDanger
+                                : remainingAfterAmount < activeLimitStatus.limit * 0.2
+                                ? styles.catRemainingBadgeTextWarning
+                                : styles.catRemainingBadgeTextSuccess,
+                              ]}
+                            >
+                              {remainingAfterAmount >= 0
+                                ? `${formatINR(remainingAfterAmount)} left`
+                                : `Over by ${formatINR(Math.abs(remainingAfterAmount))}`}
+                            </Text>
+                          </View>
+                        </View>
+
+                        <View style={styles.catBudgetDetailsRow}>
+                          <Text style={styles.catBudgetSubText}>
+                            Limit: <Text style={{ fontWeight: '700', color: '#0F172A' }}>{formatINR(activeLimitStatus.limit)}</Text>
+                          </Text>
+                          <Text style={styles.catBudgetSubText}>
+                            Spent so far: <Text style={{ fontWeight: '700', color: '#DC2626' }}>{formatINR(currentSpentAdjusted)}</Text>
+                          </Text>
+                          {enteredAmountNum > 0 && (
+                            <Text style={styles.catBudgetSubText}>
+                              This bill: <Text style={{ fontWeight: '700', color: '#2563EB' }}>-{formatINR(enteredAmountNum)}</Text>
+                            </Text>
+                          )}
+                        </View>
+
+                        {/* Progress Bar */}
+                        <View style={styles.progressBarBg}>
+                          <View
+                            style={[
+                              styles.progressBarFill,
+                              {
+                                width: `${Math.min(calculatedUsedPercent, 100)}%`,
+                                backgroundColor:
+                                  remainingAfterAmount < 0
+                                    ? '#DC2626'
+                                    : calculatedUsedPercent > 80
+                                    ? '#F59E0B'
+                                    : '#10B981',
+                              },
+                            ]}
+                          />
+                        </View>
+
+                        {remainingAfterAmount < 0 && (
+                          <Text style={styles.catBudgetWarningText}>
+                            ⚠️ This expense will exceed your monthly limit for {activeLimitStatus.category} by {formatINR(Math.abs(remainingAfterAmount))}!
+                          </Text>
+                        )}
                       </View>
-                      <TextInput
-                        style={styles.customCatInput}
-                        placeholder="e.g. Gym, Books, Petrol, Maintenance, Pet Care..."
-                        placeholderTextColor="#94A3B8"
-                        value={customCategoryInput}
-                        onChangeText={setCustomCategoryInput}
-                        autoCapitalize="words"
-                      />
-                      <Text style={styles.customCatHint}>
-                        ⚡ This custom category will be tracked in your monthly pie chart & histogram!
-                      </Text>
-                    </View>
-                  )}
+                    )}
+
+                    {/* 5.1 Custom Category Input (When 'Other' category is selected) */}
+                    {selectedCategory &&
+                      (selectedCategory.name.toLowerCase().includes('other') ||
+                        selectedCategory.id.includes('other')) && (
+                        <View style={styles.customCatBox}>
+                          <View style={styles.customCatHeader}>
+                            <Ionicons name="sparkles" size={15} color="#4F46E5" />
+                            <Text style={styles.customCatTitle}>Specify Custom Category Name</Text>
+                          </View>
+                          <TextInput
+                            style={styles.customCatInput}
+                            placeholder="e.g. Gym, Books, Petrol, Maintenance, Pet Care..."
+                            placeholderTextColor="#94A3B8"
+                            value={customCategoryInput}
+                            onChangeText={setCustomCategoryInput}
+                            autoCapitalize="words"
+                          />
+                          <Text style={styles.customCatHint}>
+                            ⚡ This custom category will be tracked in your monthly pie chart & histogram!
+                          </Text>
+                        </View>
+                      )}
+                  </>
+                )}
 
                 {/* 6. Date Selection */}
                 <View style={styles.dateLabelRow}>
@@ -2953,9 +3275,22 @@ export default function App() {
                 />
 
                 {/* Save Button */}
-                <TouchableOpacity style={styles.saveButton} onPress={handleSaveTransaction}>
+                <TouchableOpacity
+                  style={[
+                    styles.saveButton,
+                    txType === 'transfer' && { backgroundColor: '#4F46E5' },
+                    txType === 'income' && { backgroundColor: '#16A34A' },
+                  ]}
+                  onPress={handleSaveTransaction}
+                >
                   <Text style={styles.saveButtonText}>
-                    {editingTransaction ? 'Update Transaction' : 'Save to Offline SQLite'}
+                    {editingTransaction
+                      ? txType === 'transfer'
+                        ? 'Update Transfer'
+                        : 'Update Transaction'
+                      : txType === 'transfer'
+                      ? 'Confirm Wallet Transfer'
+                      : 'Save to Offline SQLite'}
                   </Text>
                 </TouchableOpacity>
               </ScrollView>
@@ -3629,6 +3964,12 @@ export default function App() {
         </Modal>
       </View>
     </SafeAreaView>
+    {showSplash && (
+      <View style={styles.splashOverlayContainer}>
+        <SplashScreen key={splashKey} onFinish={() => setShowSplash(false)} />
+      </View>
+    )}
+  </View>
   );
 }
 
@@ -3637,6 +3978,18 @@ const isWeb = Platform.OS === 'web';
 const ANDROID_BOTTOM_NAV_HEIGHT = Platform.OS === 'android' ? 40 : 0;
 
 const styles = StyleSheet.create({
+  rootWrapper: {
+    flex: 1,
+    backgroundColor: '#040814',
+    position: 'relative',
+    width: '100%',
+    height: '100%',
+  },
+  splashOverlayContainer: {
+    ...StyleSheet.absoluteFill,
+    zIndex: 999999,
+    elevation: 999999,
+  },
   safeArea: {
     flex: 1,
     backgroundColor: '#F1F5F9',
@@ -4070,6 +4423,14 @@ const styles = StyleSheet.create({
   cashPillText: {
     color: '#059669',
   },
+  transferPill: {
+    backgroundColor: '#F5F3FF',
+    borderWidth: 0.5,
+    borderColor: '#C7D2FE',
+  },
+  transferPillText: {
+    color: '#4F46E5',
+  },
   transactionMeta: {
     fontSize: 11,
     color: '#64748B',
@@ -4482,6 +4843,40 @@ const styles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 16,
   },
+  splashPreviewBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFFBEB',
+    borderWidth: 1.5,
+    borderColor: '#FDE68A',
+    borderRadius: 14,
+    padding: 14,
+    marginTop: 10,
+    marginBottom: 4,
+    shadowColor: '#D97706',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 6,
+    elevation: 2,
+  },
+  splashPreviewIconBg: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#FEF3C7',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  splashPreviewTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#92400E',
+  },
+  splashPreviewDesc: {
+    fontSize: 11,
+    color: '#B45309',
+    marginTop: 2,
+  },
   fab: {
     position: 'absolute',
     bottom: 74 + ANDROID_BOTTOM_NAV_HEIGHT,
@@ -4582,6 +4977,154 @@ const styles = StyleSheet.create({
   },
   typeButtonActiveIncome: {
     backgroundColor: '#16A34A',
+  },
+  typeButtonActiveTransfer: {
+    backgroundColor: '#4F46E5',
+  },
+  headerTransferBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EEF2FF',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#C7D2FE',
+    gap: 4,
+  },
+  headerTransferBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#4F46E5',
+  },
+  transferDirectionSection: {
+    marginBottom: 14,
+  },
+  transferOptionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 8,
+  },
+  transferOptionCard: {
+    flex: 1,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1.5,
+    borderColor: '#E2E8F0',
+    borderRadius: 12,
+    padding: 10,
+  },
+  transferOptionCardActiveCashToUpi: {
+    backgroundColor: '#F5F3FF',
+    borderColor: '#6366F1',
+  },
+  transferOptionCardActiveUpiToCash: {
+    backgroundColor: '#F0F9FF',
+    borderColor: '#0EA5E9',
+  },
+  transferOptionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  transferOptionEmoji: {
+    fontSize: 16,
+  },
+  transferBadgeMini: {
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+    borderRadius: 4,
+    backgroundColor: '#E2E8F0',
+  },
+  transferBadgeMiniActiveCash: {
+    backgroundColor: '#EEF2FF',
+  },
+  transferBadgeMiniActiveUpi: {
+    backgroundColor: '#E0F2FE',
+  },
+  transferBadgeMiniText: {
+    fontSize: 8.5,
+    fontWeight: '800',
+    color: '#64748B',
+    textTransform: 'uppercase',
+  },
+  transferBadgeMiniTextActive: {
+    color: '#4F46E5',
+  },
+  transferOptionTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1E293B',
+    marginBottom: 2,
+  },
+  transferOptionTitleActive: {
+    color: '#1E1B4B',
+  },
+  transferOptionSub: {
+    fontSize: 10,
+    color: '#64748B',
+    lineHeight: 13,
+    marginBottom: 6,
+  },
+  transferAvailText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#475569',
+  },
+  transferInfoBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EEF2FF',
+    borderWidth: 1,
+    borderColor: '#C7D2FE',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginTop: 2,
+  },
+  transferInfoText: {
+    fontSize: 11,
+    color: '#3730A3',
+    lineHeight: 15,
+    flex: 1,
+  },
+  transferPresetChipsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginVertical: 8,
+  },
+  transferPresetChip: {
+    backgroundColor: '#F1F5F9',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  transferPresetChipText: {
+    fontSize: 11,
+    color: '#475569',
+    fontWeight: '600',
+  },
+  transferAmountPresetsRow: {
+    flexDirection: 'row',
+    gap: 6,
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  transferAmountPresetChip: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: '#EEF2FF',
+    borderWidth: 1,
+    borderColor: '#C7D2FE',
+  },
+  transferAmountPresetChipText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#4F46E5',
   },
   typeButtonText: {
     color: '#64748B',

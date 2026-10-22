@@ -29,6 +29,7 @@ export interface MonthlyPdfData {
   summary: WalletSummary;
   incomeTransactions: Transaction[];
   expenseTransactions: Transaction[];
+  transferTransactions?: Transaction[];
   categoryBreakdown: CategorySpend[];
   profileName?: string;
   generatedAt?: Date;
@@ -44,6 +45,7 @@ export function generateMonthlyStatementHtml(data: MonthlyPdfData): string {
     summary,
     incomeTransactions,
     expenseTransactions,
+    transferTransactions = [],
     categoryBreakdown,
     profileName,
     generatedAt = new Date(),
@@ -194,6 +196,34 @@ export function generateMonthlyStatementHtml(data: MonthlyPdfData): string {
           })
           .join('')
       : `<tr><td colspan="7" class="empty-state">No expense transactions recorded for ${escapeHtml(monthDisplay)}.</td></tr>`;
+
+  // HTML rows for Transfer Transactions (Hand ⇄ UPI)
+  const sortedTransfers = [...(transferTransactions || [])].sort(
+    (a, b) => a.date.localeCompare(b.date) || a.id - b.id
+  );
+  const transferRows =
+    sortedTransfers.length > 0
+      ? sortedTransfers
+          .map((tx, idx) => {
+            const isCashToUpi = tx.paymentMethod === 'cash';
+            return `
+        <tr>
+          <td class="text-center text-muted font-mono">${idx + 1}</td>
+          <td class="nowrap">${formatDateDisplay(tx.date)}</td>
+          <td><strong>${escapeHtml(tx.title)}</strong></td>
+          <td><span class="category-tag">${escapeHtml(tx.category)}</span></td>
+          <td class="text-center">
+            <span class="badge badge-transfer">
+              ${isCashToUpi ? 'Hand ➔ UPI' : 'UPI ➔ Hand'}
+            </span>
+          </td>
+          <td class="notes-cell">${escapeHtml(tx.notes || '-')}</td>
+          <td class="amount-cell text-indigo font-bold">⇄ ${formatCurrency(tx.amount)}</td>
+        </tr>
+      `;
+          })
+          .join('')
+      : '';
 
   return `
 <!DOCTYPE html>
@@ -503,6 +533,14 @@ export function generateMonthlyStatementHtml(data: MonthlyPdfData): string {
       color: #B45309;
       border: 1px solid #FDE68A;
     }
+    .badge-transfer {
+      background-color: #F5F3FF;
+      color: #6366F1;
+      border: 1px solid #DDD6FE;
+    }
+    .text-indigo {
+      color: #4F46E5 !important;
+    }
     .category-tag {
       display: inline-block;
       padding: 2px 7px;
@@ -746,6 +784,36 @@ export function generateMonthlyStatementHtml(data: MonthlyPdfData): string {
         }
       </table>
     </div>
+
+    <!-- 5b. INTERNAL TRANSFERS (HAND ⇄ UPI) -->
+    ${
+      sortedTransfers.length > 0
+        ? `
+    <div class="section-container avoid-break">
+      <div class="section-title">
+        <span>5b. Internal Transfers (Hand ⇄ UPI)</span>
+        <span class="section-subtitle">${sortedTransfers.length} transfer records (Zero Net Impact on Total Balance)</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 5%;" class="text-center">#</th>
+            <th style="width: 13%;">Date</th>
+            <th style="width: 28%;">Description / Title</th>
+            <th style="width: 18%;">Category</th>
+            <th style="width: 14%;" class="text-center">Direction</th>
+            <th style="width: 8%;">Notes</th>
+            <th class="amount-cell" style="width: 14%;">Amount</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${transferRows}
+        </tbody>
+      </table>
+    </div>
+    `
+        : ''
+    }
 
     <!-- 6. FINAL SUMMARY RECONCILIATION -->
     <div class="reconciliation-card avoid-break">
