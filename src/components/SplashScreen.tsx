@@ -21,6 +21,7 @@ import Svg, {
   G,
   Ellipse,
 } from 'react-native-svg';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 interface SplashScreenProps {
   onFinish?: () => void;
@@ -29,6 +30,8 @@ interface SplashScreenProps {
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 export default function SplashScreen({ onFinish }: SplashScreenProps) {
+  const insets = useSafeAreaInsets();
+
   // Master Exit Animation (at 4000ms -> fades out whole splash over 400ms)
   const [masterFade] = useState(() => new Animated.Value(1));
 
@@ -557,6 +560,8 @@ export default function SplashScreen({ onFinish }: SplashScreenProps) {
         style={[
           styles.brandContainer,
           {
+            bottom: Math.max(insets.bottom + 20, 72),
+            right: Math.max(insets.right + 20, 24),
             opacity: brandOpacity,
             transform: [{ translateY: brandTranslateY }],
           },
@@ -655,8 +660,6 @@ const styles = StyleSheet.create({
   },
   brandContainer: {
     position: 'absolute',
-    bottom: Platform.OS === 'ios' ? 52 : 38,
-    right: 28,
     alignItems: 'flex-end',
   },
   brandTitle: {

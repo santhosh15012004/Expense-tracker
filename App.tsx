@@ -16,7 +16,7 @@ import {
   AppState,
   AppStateStatus,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { G, Path, Circle, Rect, Text as SvgText } from 'react-native-svg';
 import {
@@ -526,6 +526,7 @@ export default function App() {
 
   // Add / Edit Modal State
   const [modalVisible, setModalVisible] = useState(false);
+  const [transferModalVisible, setTransferModalVisible] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const [txType, setTxType] = useState<TransactionType>('expense');
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('upi');
@@ -815,23 +816,23 @@ export default function App() {
     loadAllData();
   }, [loadAllData, activeProfile.id]);
 
-  // Open Add Modal with pre-configured wallet & type
-  const openAddModal = (type: TransactionType = 'expense', method: PaymentMethod = 'upi') => {
+  // Open Add Modal with pre-configured wallet & type (Expense or Income only)
+  const openAddModal = (type: 'expense' | 'income' = 'expense', method: PaymentMethod = 'upi') => {
     setEditingTransaction(null);
     setTxType(type);
     setPaymentMethod(method);
-    setTitle(type === 'transfer' ? (method === 'cash' ? 'Hand to UPI Deposit' : 'ATM Cash Withdrawal') : '');
+    setTitle('');
     setAmount('');
     setNotes('');
     setCustomCategoryInput('');
     setTxDate(getTodayDateString());
 
     const matchingCat = categories.find((c) => c.type === type) || categories[0] || null;
-    setSelectedCategory(type === 'transfer' ? null : matchingCat);
+    setSelectedCategory(matchingCat);
     setModalVisible(true);
   };
 
-  // Open Transfer Modal specifically (Hand ➔ UPI or UPI ➔ Hand)
+  // Open Transfer Modal specifically (Hand ➔ UPI or UPI ➔ Hand) - Dedicated Modal
   const openTransferModal = (direction: 'cash_to_upi' | 'upi_to_cash' = 'cash_to_upi') => {
     setEditingTransaction(null);
     setTxType('transfer');
@@ -842,7 +843,7 @@ export default function App() {
     setCustomCategoryInput('');
     setTxDate(getTodayDateString());
     setSelectedCategory(null);
-    setModalVisible(true);
+    setTransferModalVisible(true);
   };
 
   // Open Edit Modal
@@ -858,7 +859,7 @@ export default function App() {
     if (tx.type === 'transfer') {
       setSelectedCategory(null);
       setCustomCategoryInput('');
-      setModalVisible(true);
+      setTransferModalVisible(true);
       return;
     }
 
@@ -1004,6 +1005,7 @@ export default function App() {
         }
 
         setModalVisible(false);
+        setTransferModalVisible(false);
         setCustomCategoryInput('');
         loadAllData();
       } catch (e: any) {
@@ -1206,10 +1208,11 @@ export default function App() {
   };
 
   return (
-    <View style={styles.rootWrapper}>
-      <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
-      <View style={styles.appContainer}>
+    <SafeAreaProvider style={styles.safeAreaProvider}>
+      <View style={styles.rootWrapper}>
+        <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right', 'bottom']}>
+          <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
+          <View style={styles.appContainer}>
         {/* Top Header */}
         <View style={styles.header}>
           <View style={styles.headerBrand}>
@@ -2721,7 +2724,7 @@ export default function App() {
                 keyboardDismissMode="on-drag"
                 contentContainerStyle={styles.modalScrollContent}
               >
-                {/* 1. Transaction Type (Expense vs Income vs Transfer) */}
+                {/* 1. Transaction Type (Expense vs Income ONLY) */}
                 <View style={styles.typeSelector}>
                   <TouchableOpacity
                     style={[styles.typeButton, txType === 'expense' && styles.typeButtonActiveExpense]}
@@ -2750,153 +2753,55 @@ export default function App() {
                       Income
                     </Text>
                   </TouchableOpacity>
+                </View>
 
+                {/* 2. CHOOSE WALLET: CASH vs UPI */}
+                <Text style={styles.inputLabel}>Select Wallet / Account</Text>
+                <View style={styles.walletPickRow}>
                   <TouchableOpacity
-                    style={[styles.typeButton, txType === 'transfer' && styles.typeButtonActiveTransfer]}
-                    onPress={() => handleTypeChange('transfer')}
+                    style={[
+                      styles.walletPickBtn,
+                      paymentMethod === 'upi' && styles.walletPickBtnActiveUpi,
+                    ]}
+                    onPress={() => setPaymentMethod('upi')}
                   >
+                    <Ionicons
+                      name="qr-code-outline"
+                      size={18}
+                      color={paymentMethod === 'upi' ? '#4F46E5' : '#64748B'}
+                    />
                     <Text
                       style={[
-                        styles.typeButtonText,
-                        txType === 'transfer' && styles.typeButtonTextActive,
+                        styles.walletPickBtnText,
+                        paymentMethod === 'upi' && styles.walletPickBtnTextActiveUpi,
                       ]}
                     >
-                      ⇄ Transfer
+                      📱 UPI (GPay/PhonePe)
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.walletPickBtn,
+                      paymentMethod === 'cash' && styles.walletPickBtnActiveCash,
+                    ]}
+                    onPress={() => setPaymentMethod('cash')}
+                  >
+                    <Ionicons
+                      name="cash-outline"
+                      size={18}
+                      color={paymentMethod === 'cash' ? '#059669' : '#64748B'}
+                    />
+                    <Text
+                      style={[
+                        styles.walletPickBtnText,
+                        paymentMethod === 'cash' && styles.walletPickBtnTextActiveCash,
+                      ]}
+                    >
+                      💵 Cash in Hand
                     </Text>
                   </TouchableOpacity>
                 </View>
-
-                {/* 2. CHOOSE TRANSFER DIRECTION OR WALLET */}
-                {txType === 'transfer' ? (
-                  <View style={styles.transferDirectionSection}>
-                    <Text style={styles.inputLabel}>Choose Transfer Direction</Text>
-                    <View style={styles.transferOptionsRow}>
-                      {/* Option A: Hand to UPI */}
-                      <TouchableOpacity
-                        style={[
-                          styles.transferOptionCard,
-                          paymentMethod === 'cash' && styles.transferOptionCardActiveCashToUpi,
-                        ]}
-                        onPress={() => {
-                          setPaymentMethod('cash');
-                          if (!title || title === 'ATM Cash Withdrawal' || title === 'Hand to UPI Deposit' || title.startsWith('Transfer:')) {
-                            setTitle('Hand to UPI Deposit');
-                          }
-                        }}
-                      >
-                        <View style={styles.transferOptionHeader}>
-                          <Text style={styles.transferOptionEmoji}>💵 ➔ 📱</Text>
-                          <View style={[styles.transferBadgeMini, paymentMethod === 'cash' && styles.transferBadgeMiniActiveCash]}>
-                            <Text style={[styles.transferBadgeMiniText, paymentMethod === 'cash' && styles.transferBadgeMiniTextActive]}>
-                              Deposit
-                            </Text>
-                          </View>
-                        </View>
-                        <Text style={[styles.transferOptionTitle, paymentMethod === 'cash' && styles.transferOptionTitleActive]}>
-                          Hand to UPI
-                        </Text>
-                        <Text style={styles.transferOptionSub}>
-                          Deposit cash into bank / GPay / PhonePe
-                        </Text>
-                        <Text style={styles.transferAvailText}>
-                          In Hand: {formatINR(allTimeWallet.cashBalance)}
-                        </Text>
-                      </TouchableOpacity>
-
-                      {/* Option B: UPI to Hand */}
-                      <TouchableOpacity
-                        style={[
-                          styles.transferOptionCard,
-                          paymentMethod === 'upi' && styles.transferOptionCardActiveUpiToCash,
-                        ]}
-                        onPress={() => {
-                          setPaymentMethod('upi');
-                          if (!title || title === 'Hand to UPI Deposit' || title === 'ATM Cash Withdrawal' || title.startsWith('Transfer:')) {
-                            setTitle('ATM Cash Withdrawal');
-                          }
-                        }}
-                      >
-                        <View style={styles.transferOptionHeader}>
-                          <Text style={styles.transferOptionEmoji}>📱 ➔ 💵</Text>
-                          <View style={[styles.transferBadgeMini, paymentMethod === 'upi' && styles.transferBadgeMiniActiveUpi]}>
-                            <Text style={[styles.transferBadgeMiniText, paymentMethod === 'upi' && styles.transferBadgeMiniTextActive]}>
-                              Withdraw
-                            </Text>
-                          </View>
-                        </View>
-                        <Text style={[styles.transferOptionTitle, paymentMethod === 'upi' && styles.transferOptionTitleActive]}>
-                          UPI to Hand
-                        </Text>
-                        <Text style={styles.transferOptionSub}>
-                          ATM cash withdrawal / Cash out
-                        </Text>
-                        <Text style={styles.transferAvailText}>
-                          UPI Bal: {formatINR(allTimeWallet.upiBalance)}
-                        </Text>
-                      </TouchableOpacity>
-                    </View>
-
-                    {/* Explanatory summary card */}
-                    <View style={styles.transferInfoBox}>
-                      <Ionicons name="information-circle-outline" size={16} color="#4F46E5" style={{ marginRight: 6 }} />
-                      <Text style={styles.transferInfoText}>
-                        {paymentMethod === 'cash'
-                          ? '💵 Cash in Hand will decrease & 📱 UPI Balance will increase. Overall Net Balance remains unchanged.'
-                          : '📱 UPI Balance will decrease & 💵 Cash in Hand will increase. Overall Net Balance remains unchanged.'}
-                      </Text>
-                    </View>
-                  </View>
-                ) : (
-                  <>
-                    {/* 2. CHOOSE WALLET: CASH vs UPI (Crucial Feature) */}
-                    <Text style={styles.inputLabel}>Select Wallet / Account</Text>
-                    <View style={styles.walletPickRow}>
-                      <TouchableOpacity
-                        style={[
-                          styles.walletPickBtn,
-                          paymentMethod === 'upi' && styles.walletPickBtnActiveUpi,
-                        ]}
-                        onPress={() => setPaymentMethod('upi')}
-                      >
-                        <Ionicons
-                          name="qr-code-outline"
-                          size={18}
-                          color={paymentMethod === 'upi' ? '#4F46E5' : '#64748B'}
-                        />
-                        <Text
-                          style={[
-                            styles.walletPickBtnText,
-                            paymentMethod === 'upi' && styles.walletPickBtnTextActiveUpi,
-                          ]}
-                        >
-                          📱 UPI (GPay/PhonePe)
-                        </Text>
-                      </TouchableOpacity>
-
-                      <TouchableOpacity
-                        style={[
-                          styles.walletPickBtn,
-                          paymentMethod === 'cash' && styles.walletPickBtnActiveCash,
-                        ]}
-                        onPress={() => setPaymentMethod('cash')}
-                      >
-                        <Ionicons
-                          name="cash-outline"
-                          size={18}
-                          color={paymentMethod === 'cash' ? '#059669' : '#64748B'}
-                        />
-                        <Text
-                          style={[
-                            styles.walletPickBtnText,
-                            paymentMethod === 'cash' && styles.walletPickBtnTextActiveCash,
-                          ]}
-                        >
-                          💵 Cash in Hand
-                        </Text>
-                      </TouchableOpacity>
-                    </View>
-                  </>
-                )}
 
                 {/* 3. Amount Input in ₹ */}
                 <Text style={styles.inputLabel}>Amount (₹)</Text>
@@ -2908,58 +2813,22 @@ export default function App() {
                   value={amount}
                   onChangeText={setAmount}
                 />
-                {txType === 'transfer' && (
-                  <View style={styles.transferAmountPresetsRow}>
-                    {[500, 1000, 2000, 5000].map((amt) => (
-                      <TouchableOpacity
-                        key={amt}
-                        style={styles.transferAmountPresetChip}
-                        onPress={() => setAmount(String(amt))}
-                      >
-                        <Text style={styles.transferAmountPresetChipText}>+₹{amt}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                )}
-
                 {/* 4. Title / Description */}
-                <Text style={styles.inputLabel}>
-                  {txType === 'transfer' ? 'Transfer Description' : 'Description / Title'}
-                </Text>
+                <Text style={styles.inputLabel}>Description / Title</Text>
                 <TextInput
                   style={styles.input}
                   placeholder={
-                    txType === 'transfer'
-                      ? paymentMethod === 'cash'
-                        ? 'e.g. Hand to UPI Deposit, Bank CDM'
-                        : 'e.g. ATM Cash Withdrawal'
-                      : 'e.g. Chai, Auto, Groceries, Salary'
+                    txType === 'income'
+                      ? 'e.g. Salary, Freelance, Cashback, Gift'
+                      : 'e.g. Chai, Auto, Groceries, Dinner'
                   }
                   placeholderTextColor="#94A3B8"
                   value={title}
                   onChangeText={setTitle}
                 />
-                {txType === 'transfer' && (
-                  <View style={styles.transferPresetChipsRow}>
-                    {(paymentMethod === 'cash'
-                      ? ['Hand to UPI Deposit', 'Deposited at CDM/Branch', 'Gave cash, friend UPI-ed', 'Self Deposit']
-                      : ['ATM Cash Withdrawal', 'Self Withdrawal', 'Friend gave cash for UPI', 'Branch Cash Out']
-                    ).map((preset) => (
-                      <TouchableOpacity
-                        key={preset}
-                        style={styles.transferPresetChip}
-                        onPress={() => setTitle(preset)}
-                      >
-                        <Text style={styles.transferPresetChipText}>{preset}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                )}
 
-                {/* 5. Category Horizontal Scroll (Expenses & Income Only) */}
-                {txType !== 'transfer' && (
-                  <>
-                    <Text style={styles.inputLabel}>Category</Text>
+                {/* 5. Category Horizontal Scroll */}
+                <Text style={styles.inputLabel}>Category</Text>
                     <ScrollView
                       horizontal
                       showsHorizontalScrollIndicator={false}
@@ -3122,8 +2991,6 @@ export default function App() {
                           </Text>
                         </View>
                       )}
-                  </>
-                )}
 
                 {/* 6. Date Selection */}
                 <View style={styles.dateLabelRow}>
@@ -3278,19 +3145,278 @@ export default function App() {
                 <TouchableOpacity
                   style={[
                     styles.saveButton,
-                    txType === 'transfer' && { backgroundColor: '#4F46E5' },
                     txType === 'income' && { backgroundColor: '#16A34A' },
                   ]}
                   onPress={handleSaveTransaction}
                 >
                   <Text style={styles.saveButtonText}>
-                    {editingTransaction
-                      ? txType === 'transfer'
-                        ? 'Update Transfer'
-                        : 'Update Transaction'
-                      : txType === 'transfer'
-                      ? 'Confirm Wallet Transfer'
-                      : 'Save to Offline SQLite'}
+                    {editingTransaction ? 'Update Transaction' : 'Save to Offline SQLite'}
+                  </Text>
+                </TouchableOpacity>
+              </ScrollView>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
+
+        {/* DEDICATED SEPARATE SELF WALLET TRANSFER MODAL (UPI ⇄ CASH) */}
+        <Modal
+          visible={transferModalVisible}
+          animationType="slide"
+          transparent
+          onRequestClose={() => setTransferModalVisible(false)}
+        >
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.modalOverlay}
+          >
+            <View style={styles.modalCard}>
+              {/* Header */}
+              <View style={styles.modalHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                  <View style={[styles.walletIconCircle, { backgroundColor: '#EEF2FF', width: 38, height: 38 }]}>
+                    <Ionicons name="swap-horizontal" size={20} color="#4F46E5" />
+                  </View>
+                  <View>
+                    <Text style={styles.modalTitle}>
+                      {editingTransaction ? 'Edit Wallet Transfer' : 'Self Wallet Transfer'}
+                    </Text>
+                    <Text style={styles.walletHint}>Hand in Cash ⇄ UPI / Bank</Text>
+                  </View>
+                </View>
+                <TouchableOpacity onPress={() => setTransferModalVisible(false)}>
+                  <Ionicons name="close" size={24} color="#64748B" />
+                </TouchableOpacity>
+              </View>
+
+              {/* Profile Context Pill */}
+              <View style={styles.modalProfilePillWrap}>
+                <View style={[styles.profileAvatarMini, { backgroundColor: activeProfile.color || '#2563EB' }]}>
+                  <Ionicons name={(activeProfile.icon || 'person') as any} size={10} color="#FFFFFF" />
+                </View>
+                <Text style={styles.modalProfilePillText}>
+                  Recording for: <Text style={{ fontWeight: '700', color: activeProfile.color || '#2563EB' }}>{activeProfile.name}</Text>
+                </Text>
+              </View>
+
+              <ScrollView
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode="on-drag"
+                contentContainerStyle={styles.modalScrollContent}
+              >
+                {/* 1. CHOOSE TRANSFER DIRECTION */}
+                <Text style={styles.inputLabel}>Choose Transfer Direction</Text>
+                <View style={styles.transferOptionsRow}>
+                  {/* Option A: Hand to UPI */}
+                  <TouchableOpacity
+                    style={[
+                      styles.transferOptionCard,
+                      paymentMethod === 'cash' && styles.transferOptionCardActiveCashToUpi,
+                    ]}
+                    onPress={() => {
+                      setPaymentMethod('cash');
+                      if (!title || title === 'ATM Cash Withdrawal' || title === 'Hand to UPI Deposit' || title.startsWith('Transfer:')) {
+                        setTitle('Hand to UPI Deposit');
+                      }
+                    }}
+                  >
+                    <View style={styles.transferOptionHeader}>
+                      <Text style={styles.transferOptionEmoji}>💵 ➔ 📱</Text>
+                      <View style={[styles.transferBadgeMini, paymentMethod === 'cash' && styles.transferBadgeMiniActiveCash]}>
+                        <Text style={[styles.transferBadgeMiniText, paymentMethod === 'cash' && styles.transferBadgeMiniTextActive]}>
+                          Deposit
+                        </Text>
+                      </View>
+                    </View>
+                    <Text style={[styles.transferOptionTitle, paymentMethod === 'cash' && styles.transferOptionTitleActive]}>
+                      Hand to UPI
+                    </Text>
+                    <Text style={styles.transferOptionSub}>
+                      Deposit cash into bank / GPay / PhonePe
+                    </Text>
+                    <Text style={styles.transferAvailText}>
+                      In Hand: {formatINR(allTimeWallet.cashBalance)}
+                    </Text>
+                  </TouchableOpacity>
+
+                  {/* Option B: UPI to Hand */}
+                  <TouchableOpacity
+                    style={[
+                      styles.transferOptionCard,
+                      paymentMethod === 'upi' && styles.transferOptionCardActiveUpiToCash,
+                    ]}
+                    onPress={() => {
+                      setPaymentMethod('upi');
+                      if (!title || title === 'Hand to UPI Deposit' || title === 'ATM Cash Withdrawal' || title.startsWith('Transfer:')) {
+                        setTitle('ATM Cash Withdrawal');
+                      }
+                    }}
+                  >
+                    <View style={styles.transferOptionHeader}>
+                      <Text style={styles.transferOptionEmoji}>📱 ➔ 💵</Text>
+                      <View style={[styles.transferBadgeMini, paymentMethod === 'upi' && styles.transferBadgeMiniActiveUpi]}>
+                        <Text style={[styles.transferBadgeMiniText, paymentMethod === 'upi' && styles.transferBadgeMiniTextActive]}>
+                          Withdraw
+                        </Text>
+                      </View>
+                    </View>
+                    <Text style={[styles.transferOptionTitle, paymentMethod === 'upi' && styles.transferOptionTitleActive]}>
+                      UPI to Hand
+                    </Text>
+                    <Text style={styles.transferOptionSub}>
+                      ATM cash withdrawal / Cash out
+                    </Text>
+                    <Text style={styles.transferAvailText}>
+                      UPI Bal: {formatINR(allTimeWallet.upiBalance)}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
+                {/* Explanatory summary card */}
+                <View style={styles.transferInfoBox}>
+                  <Ionicons name="information-circle-outline" size={16} color="#4F46E5" style={{ marginRight: 6 }} />
+                  <Text style={styles.transferInfoText}>
+                    {paymentMethod === 'cash'
+                      ? '💵 Cash in Hand will decrease & 📱 UPI Balance will increase. Overall Net Balance remains unchanged.'
+                      : '📱 UPI Balance will decrease & 💵 Cash in Hand will increase. Overall Net Balance remains unchanged.'}
+                  </Text>
+                </View>
+
+                {/* 2. Amount Input in ₹ */}
+                <Text style={styles.inputLabel}>Transfer Amount (₹) *</Text>
+                <TextInput
+                  style={[styles.input, { fontSize: 22, fontWeight: '700', color: '#0F172A' }]}
+                  placeholder="0.00"
+                  placeholderTextColor="#94A3B8"
+                  keyboardType="decimal-pad"
+                  value={amount}
+                  onChangeText={setAmount}
+                />
+                <View style={styles.transferAmountPresetsRow}>
+                  {[500, 1000, 2000, 5000].map((amt) => (
+                    <TouchableOpacity
+                      key={amt}
+                      style={styles.transferAmountPresetChip}
+                      onPress={() => setAmount(String(amt))}
+                    >
+                      <Text style={styles.transferAmountPresetChipText}>+₹{amt}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* 3. Description / Title */}
+                <Text style={styles.inputLabel}>Transfer Description</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder={
+                    paymentMethod === 'cash'
+                      ? 'e.g. Hand to UPI Deposit, Bank CDM'
+                      : 'e.g. ATM Cash Withdrawal'
+                  }
+                  placeholderTextColor="#94A3B8"
+                  value={title}
+                  onChangeText={setTitle}
+                />
+                <View style={styles.transferPresetChipsRow}>
+                  {(paymentMethod === 'cash'
+                    ? ['Hand to UPI Deposit', 'Deposited at CDM/Branch', 'Gave cash, friend UPI-ed', 'Self Deposit']
+                    : ['ATM Cash Withdrawal', 'Self Withdrawal', 'Friend gave cash for UPI', 'Branch Cash Out']
+                  ).map((preset) => (
+                    <TouchableOpacity
+                      key={preset}
+                      style={styles.transferPresetChip}
+                      onPress={() => setTitle(preset)}
+                    >
+                      <Text style={styles.transferPresetChipText}>{preset}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {/* 4. Date Selection */}
+                <View style={styles.dateLabelRow}>
+                  <Text style={styles.inputLabel}>Transfer Date</Text>
+                  <TouchableOpacity
+                    style={styles.calendarPickerTrigger}
+                    onPress={() => {
+                      setCalendarMonth(normalizeDateString(txDate)?.slice(0, 7) || getLocalYearMonth());
+                      setCalendarModalVisible(true);
+                    }}
+                  >
+                    <Ionicons name="calendar" size={15} color="#4F46E5" />
+                    <Text style={styles.calendarPickerTriggerText}>Calendar</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.quickDateChipsRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.quickDateChip,
+                      txDate === getTodayDateString() && styles.quickDateChipActive,
+                    ]}
+                    onPress={() => setTxDate(getTodayDateString())}
+                  >
+                    <Ionicons
+                      name="today-outline"
+                      size={13}
+                      color={txDate === getTodayDateString() ? '#FFFFFF' : '#475569'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.quickDateChipText,
+                        txDate === getTodayDateString() && styles.quickDateChipTextActive,
+                      ]}
+                    >
+                      Today
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.quickDateChip,
+                      txDate === getYesterdayDateString() && styles.quickDateChipActive,
+                    ]}
+                    onPress={() => setTxDate(getYesterdayDateString())}
+                  >
+                    <Ionicons
+                      name="time-outline"
+                      size={13}
+                      color={txDate === getYesterdayDateString() ? '#FFFFFF' : '#475569'}
+                      style={{ marginRight: 4 }}
+                    />
+                    <Text
+                      style={[
+                        styles.quickDateChipText,
+                        txDate === getYesterdayDateString() && styles.quickDateChipTextActive,
+                      ]}
+                    >
+                      Yesterday
+                    </Text>
+                  </TouchableOpacity>
+
+                  <View style={styles.datePreviewBadge}>
+                    <Text style={styles.datePreviewText}>{formatDateDisplay(txDate)}</Text>
+                  </View>
+                </View>
+
+                {/* 5. Notes */}
+                <Text style={styles.inputLabel}>Notes / Reference (Optional)</Text>
+                <TextInput
+                  style={[styles.input, { height: 60 }]}
+                  placeholder="Any details to remember..."
+                  placeholderTextColor="#94A3B8"
+                  multiline
+                  value={notes}
+                  onChangeText={setNotes}
+                />
+
+                {/* Save Button */}
+                <TouchableOpacity
+                  style={[styles.saveButton, { backgroundColor: '#4F46E5', marginTop: 16 }]}
+                  onPress={handleSaveTransaction}
+                >
+                  <Text style={styles.saveButtonText}>
+                    {editingTransaction ? 'Update Transfer' : 'Confirm Wallet Transfer'}
                   </Text>
                 </TouchableOpacity>
               </ScrollView>
@@ -3963,24 +4089,27 @@ export default function App() {
           </KeyboardAvoidingView>
         </Modal>
       </View>
-    </SafeAreaView>
-    {showSplash && (
-      <View style={styles.splashOverlayContainer}>
-        <SplashScreen key={splashKey} onFinish={() => setShowSplash(false)} />
+        </SafeAreaView>
+        {showSplash && (
+          <View style={styles.splashOverlayContainer}>
+            <SplashScreen key={splashKey} onFinish={() => setShowSplash(false)} />
+          </View>
+        )}
       </View>
-    )}
-  </View>
+    </SafeAreaProvider>
   );
 }
 
 const isWeb = Platform.OS === 'web';
 
-const ANDROID_BOTTOM_NAV_HEIGHT = Platform.OS === 'android' ? 40 : 0;
-
 const styles = StyleSheet.create({
+  safeAreaProvider: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+  },
   rootWrapper: {
     flex: 1,
-    backgroundColor: '#040814',
+    backgroundColor: '#FFFFFF',
     position: 'relative',
     width: '100%',
     height: '100%',
@@ -3992,8 +4121,7 @@ const styles = StyleSheet.create({
   },
   safeArea: {
     flex: 1,
-    backgroundColor: '#F1F5F9',
-    paddingTop: Platform.OS === 'android' ? 34 : 0,
+    backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -4879,7 +5007,7 @@ const styles = StyleSheet.create({
   },
   fab: {
     position: 'absolute',
-    bottom: 74 + ANDROID_BOTTOM_NAV_HEIGHT,
+    bottom: 72,
     right: 18,
     backgroundColor: '#2563EB',
     flexDirection: 'row',
@@ -4901,8 +5029,7 @@ const styles = StyleSheet.create({
   },
   bottomTabBar: {
     flexDirection: 'row',
-    height: 58 + ANDROID_BOTTOM_NAV_HEIGHT,
-    paddingBottom: ANDROID_BOTTOM_NAV_HEIGHT,
+    height: 58,
     backgroundColor: '#FFFFFF',
     borderTopWidth: 1,
     borderTopColor: '#E2E8F0',
